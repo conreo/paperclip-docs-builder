@@ -123,6 +123,68 @@ Every drop is counted **by reason** in the manifest (`by_glob`, `by_locale`,
 `oversized`, `unreadable`, `empty`) — a corpus that cannot say what it excluded
 cannot be tuned.
 
+## Honouring a request from the plugin
+
+The `paperclip-docs` plugin cannot build: the runtime gives it no way to spawn a
+process. It writes a small JSON *request* instead — which sources, at which
+versions — into a folder the operator declared, and this runner is the other half:
+
+```bash
+./runner.py --requests /paperclip/offline-docs/requests --out /paperclip/offline-docs/okf-bundles --once
+./runner.py --requests /paperclip/offline-docs/requests --out /paperclip/offline-docs/okf-bundles --watch 60
+```
+
+`--once` is for cron or a systemd timer; `--watch` polls. After each request it
+writes `response.json` beside it, which the plugin reads, so the operator sees the
+outcome without reading container logs. Requests are renamed rather than deleted —
+`.done` or `.failed` — because an operator chasing a failure needs the document that
+caused it.
+
+A request is *refused by name* when it cannot be honoured (a schema from a newer
+plugin, an unknown source kind, no sources). Refusing loudly matters: a silently
+ignored request looks exactly like a build that found nothing to do. A request whose
+corpus was already built afterwards is **skipped**, which is what makes a cron and a
+settings button safe to race.
+
+## A project's own documentation
+
+`kind: local` folds a folder from this host into the corpus as a bundle — the same
+idea as the reference provisioning system's `LOCAL_DOCS`. Relative folders resolve
+against `--local-root`:
+
+```yaml
+handbook:
+  kind: local
+  title: Our handbook
+  folder: docs          # absolute, or relative to --local-root
+```
+
+Its snapshot date is the folder's own newest mtime, not the build time: build time
+would report a local bundle as fresh on every run, which is the one thing the age is
+supposed to tell an agent.
+
+## The optional vector index
+
+Keyword search is the baseline and needs nothing. If you want semantic retrieval as
+well, point the builder at an OpenAI-compatible embeddings endpoint (`/v1/embeddings`
+with `{model, input}`); the key is read from `PAPERCLIP_DOCS_EMBED_KEY`.
+
+```bash
+PAPERCLIP_DOCS_EMBED_KEY=... ./fetch.py \
+  --embed-endpoint https://api.example.com/v1/embeddings --embed-model bge-small
+```
+
+It writes two files beside the corpus — `embeddings.json` (schema, model, dimension,
+concept ids, and whether the index is *complete*) and `embeddings.bin` (a flat
+float32 matrix). No database, no native module: the plugin reads them with `node:fs`
+and does the arithmetic itself, which is the only way a worker that cannot spawn
+anything can search vectors.
+
+A failed endpoint costs you the index, **not the corpus**: the build still succeeds
+and the manifest records why there is no index. A ragged response is refused rather
+than padded, because a padded vector is incomparable with the others and the plugin
+cannot tell a padded row from a real one.
+
 ## Deployment
 
 The builder should not run inside the Paperclip image: it needs Python, `git` and
@@ -164,7 +226,7 @@ refresh on a schedule with the same command.
 python3 -m unittest discover -s tests -v
 ```
 
-42 tests. The unit tests cover the pure parts: glob matching, filters, MDX and
+59 tests. The unit tests cover the pure parts: glob matching, filters, MDX and
 GitBook stripping, frontmatter rendering, title/type/resource derivation, index
 generation, the staging swap, and config validation.
 

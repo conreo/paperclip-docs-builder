@@ -55,9 +55,26 @@ from pathlib import Path
 
 import yaml
 
-BUILDER_VERSION = "0.1.0"
+BUILDER_VERSION = "0.2.0"
+
+#: The source kinds this builder knows how to acquire. Kept here so the runner can
+#: refuse a request naming a kind it cannot honour, rather than silently fetching
+#: nothing and reporting a smaller corpus.
+SOURCE_KINDS = ("git", "wiki", "llms", "local")
 OKF_VERSION = "0.1"
 MANIFEST_FILENAME = "manifest.json"
+
+#: The optional vector index. Two files, deliberately boring: one metadata document
+#: and one flat float32 matrix. The plugin reads them with `node:fs` and does the
+#: arithmetic itself, so this needs no database, no native module and no server —
+#: which is the whole reason a corpus with a few thousand pages can be searched
+#: semantically by a worker that is not allowed to spawn anything.
+EMBEDDINGS_JSON = "embeddings.json"
+EMBEDDINGS_BIN = "embeddings.bin"
+EMBEDDINGS_SCHEMA = 1
+#: Characters of a concept embedded. Matches how much of the body is ranked, so the
+#: vector and the keyword index see the same document.
+EMBED_TEXT_CHARS = 2_000
 # A source whose upstream has not moved in a year is usually a source that has
 # relocated, not one that is finished. It is reported, not treated as an error.
 UPSTREAM_STALE_DAYS = 365
@@ -114,6 +131,10 @@ class Source:
     max_pages: int = 0
     drop_locales: bool = True
     split: str = "single"
+    #: `kind: local` — a folder on this host, for a project's own documentation.
+    #: The plugin's registry calls it `local`; this is the same idea the reference
+    #: provisioning system expressed as `LOCAL_DOCS`.
+    folder: str = ""
     # Declared facts about the upstream, carried into the manifest. A source that
     # has stopped moving is the ordinary way a corpus rots — not a build failure —
     # so it is recorded rather than discovered later by an agent reading 2021 docs
@@ -141,6 +162,9 @@ class Source:
             fallback_url=merged.get("fallback_url", ""),
             ref=merged.get("ref", ""),
             path=(merged.get("path") or "").strip("/"),
+            # `folder` is a filesystem path, not a repository path: it is not
+            # stripped of leading separators, because an absolute one is legal.
+
             include=include,
             exclude=exclude,
             convert=merged.get("convert", "auto"),
@@ -150,6 +174,7 @@ class Source:
             max_pages=int(merged.get("max_pages", 0) or 0),
             drop_locales=bool(merged.get("drop_locales", True)),
             split=merged.get("split", "single"),
+            folder=str(merged.get("folder", "") or ""),
             archived=bool(merged.get("archived", False)),
             note=str(merged.get("note", "")),
         )
@@ -911,11 +936,131 @@ def write_bundle(staging: Path, source: Source, pages: list[Page]) -> int:
     return total
 
 
-def build_source(source, workdir, log, limit=0):
+def concept_text(page: Page) -> str:
+    """What gets embedded for one concept: the same fields the keyword index ranks."""
+    parts = [page.title, page.description, " ".join(page.tags)]
+    body = re.sub(r"```.*?```", " ", page.body, flags=re.DOTALL)
+    parts.append(body[:EMBED_TEXT_CHARS])
+    return "\n".join(part for part in parts if part).strip()
+
+
+def embed_texts(
+    endpoint: str, model: str, api_key: str, texts: list[str], batch: int, log
+) -> list[list[float]]:
+    """
+    Embed a list of strings, batched.
+
+    OpenAI-compatible on purpose: `/v1/embeddings` with `{model, input}` and
+    `{data: [{embedding}]}` is what every hosted and self-hosted option speaks, so
+    this is a contract rather than a vendor choice.
+    """
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), max(1, batch)):
+        window = texts[start : start + max(1, batch)]
+        payload = json.dumps({"model": model, "input": window}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:200]
+            raise RuntimeError(f"the embedding endpoint answered {error.code}: {detail}") from error
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"the embedding endpoint could not be reached: {error}") from error
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or len(rows) != len(window):
+            raise RuntimeError(
+                f"the embedding endpoint returned {len(rows) if isinstance(rows, list) else 'no'} "
+                f"vector(s) for {len(window)} input(s)"
+            )
+        for row in rows:
+            vector = row.get("embedding") if isinstance(row, dict) else None
+            if not isinstance(vector, list) or not all(isinstance(v, (int, float)) for v in vector):
+                raise RuntimeError("the embedding endpoint returned a malformed vector")
+            vectors.append([float(v) for v in vector])
+        log(f"    embedded {min(start + len(window), len(texts))}/{len(texts)}")
+    return vectors
+
+
+def write_embeddings(
+    root: Path, pages: list[Page], vectors: list[list[float]], model: str, log, complete: bool = True
+) -> None:
+    """
+    Write the vector index beside the corpus.
+
+    A ragged matrix is refused rather than padded: padding would silently make two
+    vectors incomparable and every similarity score after them meaningless, and the
+    plugin cannot tell a padded row from a real one.
+    """
+    import struct
+
+    if not vectors:
+        return
+    dim = len(vectors[0])
+    for index, vector in enumerate(vectors):
+        if len(vector) != dim:
+            raise RuntimeError(
+                f"the embedding endpoint returned {len(vector)} dimensions for concept {index} "
+                f"and {dim} for the first; a ragged matrix cannot be searched"
+            )
+    flat = [value for vector in vectors for value in vector]
+    (root / EMBEDDINGS_BIN).write_bytes(struct.pack(f"<{len(flat)}f", *flat))
+    (root / EMBEDDINGS_JSON).write_text(
+        json.dumps(
+            {
+                "schema": EMBEDDINGS_SCHEMA,
+                "model": model,
+                "dim": dim,
+                "count": len(vectors),
+                "concept_ids": [f"{page.bundle}/{page.rel_path}" for page in pages],
+                # Scope, declared. A build that carried bundles over from a previous
+                # run has no vectors for them, so the index is partial — and an agent
+                # asking a question those bundles answer would get keyword-only
+                # ranking. Saying so is what lets the plugin report it instead of
+                # implying the whole corpus is searchable semantically.
+                "complete": complete,
+                "bundles": sorted({page.bundle for page in pages}),
+                "text_chars": EMBED_TEXT_CHARS,
+                "built_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            indent=1,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    log(f"    wrote {EMBEDDINGS_JSON} ({len(vectors)} × {dim})")
+
+
+def local_root(source: Source, local_root_dir: Path) -> Path:
+    """Where a `kind: local` folder is, whether it was declared absolute or not."""
+    folder = Path(source.folder).expanduser()
+    return folder if folder.is_absolute() else (local_root_dir / folder).resolve()
+
+
+def newest_mtime(root: Path) -> str:
+    """The newest mtime under a folder, as a UTC `Z` timestamp."""
+    newest = 0.0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    if newest == 0.0:
+        return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.datetime.fromtimestamp(newest, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_source(source, workdir, log, limit=0, local_root_dir: Path | None = None):
     """Fetch and convert one source. Never raises: failures become results."""
     started = time.monotonic()
     result = SourceResult(name=source.name, ok=False)
     warnings: list[str] = []
+    local_root_dir = local_root_dir or Path.cwd()
     try:
         if source.kind in ("git", "wiki"):
             if not source.repo:
@@ -931,12 +1076,31 @@ def build_source(source, workdir, log, limit=0):
             pages, counts, collisions = build_pages(
                 source, checkout, log, limit, timestamp_default=date, warnings=warnings
             )
+        elif source.kind == "local":
+            root = local_root(source, local_root_dir)
+            if not root.is_dir():
+                raise RuntimeError(
+                    f"the declared folder does not exist: {root}. "
+                    "A local source is a path on this host; relative paths resolve "
+                    "against --local-root."
+                )
+            log(f"  {source.name}: {root}")
+            # A folder's own newest mtime is its snapshot date. Build time would
+            # report every local bundle as fresh on every run, which is the one
+            # thing the age is supposed to tell an agent.
+            newest = newest_mtime(root)
+            result.commit_date = newest
+            pages, counts, collisions = build_pages(
+                source, root, log, limit, timestamp_default=newest, warnings=warnings
+            )
         elif source.kind == "llms":
             log(f"  {source.name}: {source.url}")
             result.commit_date = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             pages, counts, collisions = build_pages(source, None, log, limit, warnings=warnings)
         else:
-            raise RuntimeError(f"unknown kind '{source.kind}'")
+            raise RuntimeError(
+                f"unknown kind '{source.kind}'; this builder understands: {', '.join(SOURCE_KINDS)}"
+            )
         if not pages:
             # A source whose globs now match nothing used to report success and
             # overwrite its bundle with an index-only stub. That is the drift case
@@ -995,7 +1159,7 @@ def load_sources(path: Path) -> tuple[list[Source], list[str], dict]:
     return sources, global_exclude, defaults
 
 
-def check_sources(sources: list[Source]) -> int:
+def check_sources(sources: list[Source], local_root_dir: Path | None = None) -> int:
     """Resolve every source without building: what exists, and where it points."""
     failures = 0
     for source in sources:
@@ -1013,6 +1177,12 @@ def check_sources(sources: list[Source]) -> int:
                 sha = out.split()[0]
                 pin = source.ref or "default branch"
                 print(f"  ok    {label} {pin:<18} {sha[:12]}  {source.repo}")
+            elif source.kind == "local":
+                root = local_root(source, local_root_dir or Path.cwd())
+                if not root.is_dir():
+                    raise RuntimeError(f"the declared folder does not exist: {root}")
+                count = sum(1 for p in root.rglob("*") if p.is_file())
+                print(f"  ok    {label} local              {count:>6} files  {root}")
             elif source.kind == "llms":
                 text, url, warning = fetch_llms(source, lambda _msg: None)
                 if not text:
@@ -1036,6 +1206,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="resolve sources, write nothing")
     parser.add_argument("--no-previous", action="store_true")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument(
+        "--embed-endpoint",
+        default="",
+        help="OpenAI-compatible embeddings URL; enables the optional vector index",
+    )
+    parser.add_argument("--embed-model", default="", help="model name to send")
+    parser.add_argument("--embed-batch", type=int, default=64)
+    parser.add_argument(
+        "--local-root",
+        default=".",
+        help="where a `kind: local` source's relative folder resolves (default: the working directory)",
+    )
     args = parser.parse_args(argv)
 
     sources, global_exclude, defaults = load_sources(Path(args.sources))
@@ -1053,7 +1235,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         print(f"checking {len(sources)} source(s)")
-        return 1 if check_sources(sources) else 0
+        return 1 if check_sources(sources, Path(args.local_root).expanduser().resolve()) else 0
 
     out_root = Path(args.out).resolve()
     workdir = Path(args.work).resolve()
@@ -1083,7 +1265,11 @@ def main(argv: list[str] | None = None) -> int:
     results: list[SourceResult] = []
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            futures = {pool.submit(build_source, s, workdir, log, args.limit_pages): s for s in sources}
+            local_root_dir = Path(args.local_root).expanduser().resolve()
+            futures = {
+                pool.submit(build_source, s, workdir, log, args.limit_pages, local_root_dir): s
+                for s in sources
+            }
             for future in concurrent.futures.as_completed(futures):
                 source = futures[future]
                 result = future.result()
@@ -1205,6 +1391,47 @@ def main(argv: list[str] | None = None) -> int:
         if carried:
             log(f"  kept  {len(carried)} unselected bundle(s): {', '.join(sorted(carried))}")
 
+        # The optional vector index. Built from the bundles produced *this* run, so
+        # a partial index says so rather than quietly ranking some bundles
+        # semantically and others not at all.
+        embeddings_note: dict = {}
+        bundled_pages = [page for result in results if result.ok for page in result.pages_data]
+        if args.embed_endpoint:
+            if not bundled_pages:
+                embeddings_note = {"error": "no bundles were built, so there was nothing to embed"}
+            else:
+                log(f"  embedding {len(bundled_pages)} concept(s) with {args.embed_model}")
+                try:
+                    vectors = embed_texts(
+                        args.embed_endpoint,
+                        args.embed_model,
+                        os.environ.get("PAPERCLIP_DOCS_EMBED_KEY", ""),
+                        [concept_text(page) for page in bundled_pages],
+                        args.embed_batch,
+                        log,
+                    )
+                    write_embeddings(
+                        staging, bundled_pages, vectors, args.embed_model, log, complete=not carried
+                    )
+                    embeddings_note = {
+                        "model": args.embed_model,
+                        "dim": len(vectors[0]),
+                        "count": len(vectors),
+                        "complete": not carried,
+                        "bundles": sorted({page.bundle for page in bundled_pages}),
+                    }
+                    if carried:
+                        log(
+                            f"  note  the vector index covers {len(embeddings_note['bundles'])} "
+                            f"bundle(s); {len(carried)} carried-over bundle(s) are keyword-only"
+                        )
+                except RuntimeError as error:
+                    # The corpus is valid without an index. Throwing it away over an
+                    # optional extra would be the wrong trade — but saying nothing
+                    # would leave an operator believing semantic search is on.
+                    embeddings_note = {"error": str(error)}
+                    log(f"  note  no vector index: {error}")
+
         manifest = {
             "okf_version": OKF_VERSION,
             "builder": "paperclip-docs-builder",
@@ -1217,6 +1444,7 @@ def main(argv: list[str] | None = None) -> int:
                 "stale_upstreams": sorted(stale_upstreams),
                 "carried_over": sorted(carried),
             },
+            "embeddings": embeddings_note,
             "filters": {
                 "global_exclude": global_exclude,
                 # The configured defaults, not literals. Hardcoding these made the
