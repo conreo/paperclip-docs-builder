@@ -72,6 +72,12 @@ MANIFEST_FILENAME = "manifest.json"
 EMBEDDINGS_JSON = "embeddings.json"
 EMBEDDINGS_BIN = "embeddings.bin"
 EMBEDDINGS_SCHEMA = 1
+#: The journal an index build keeps beside the matrix: one concept id per line, in
+#: matrix order. It is what makes a fifty-minute job resumable, and it is also what
+#: the plugin's settings page reads to show a build in progress — two reads, no new
+#: protocol, and the same names the plugin expects.
+EMBEDDINGS_JOURNAL = "embeddings.ids.jsonl"
+EMBEDDINGS_PARTIAL = "embeddings.bin.partial"
 #: Characters of a concept embedded. Matches how much of the body is ranked, so the
 #: vector and the keyword index see the same document.
 EMBED_TEXT_CHARS = 2_000
@@ -1027,7 +1033,7 @@ def concept_text(page: Page) -> str:
 
 
 def embed_texts(
-    endpoint: str, model: str, api_key: str, texts: list[str], batch: int, log
+    endpoint: str, model: str, api_key: str, texts: list[str], batch: int, log, on_batch=None
 ) -> list[list[float]]:
     """
     Embed a list of strings, batched.
@@ -1035,6 +1041,10 @@ def embed_texts(
     OpenAI-compatible on purpose: `/v1/embeddings` with `{model, input}` and
     `{data: [{embedding}]}` is what every hosted and self-hosted option speaks, so
     this is a contract rather than a vendor choice.
+
+    `on_batch(start, vectors)` is called after each window, so a caller that has to
+    survive being killed — `--index-only` — can journal what it has instead of
+    holding the whole matrix in memory and starting over.
     """
     vectors: list[list[float]] = []
     for start in range(0, len(texts), max(1, batch)):
@@ -1058,13 +1068,44 @@ def embed_texts(
                 f"the embedding endpoint returned {len(rows) if isinstance(rows, list) else 'no'} "
                 f"vector(s) for {len(window)} input(s)"
             )
+        window_vectors: list[list[float]] = []
         for row in rows:
             vector = row.get("embedding") if isinstance(row, dict) else None
             if not isinstance(vector, list) or not all(isinstance(v, (int, float)) for v in vector):
                 raise RuntimeError("the embedding endpoint returned a malformed vector")
-            vectors.append([float(v) for v in vector])
+            window_vectors.append([float(v) for v in vector])
+        vectors.extend(window_vectors)
         log(f"    embedded {min(start + len(window), len(texts))}/{len(texts)}")
+        if on_batch is not None:
+            on_batch(start, window_vectors)
     return vectors
+
+
+def embeddings_metadata(pages: list[Page], model: str, dim: int, complete: bool) -> dict:
+    """
+    The index's metadata, in the one shape the plugin reads.
+
+    Extracted so `--index-only` cannot drift from a full build. A second copy of this
+    dictionary is how the two paths end up disagreeing about `complete` or about
+    which concept ids are in the matrix — a difference nothing notices until ranking
+    is quietly wrong.
+    """
+    return {
+        "schema": EMBEDDINGS_SCHEMA,
+        "model": model,
+        "dim": dim,
+        "count": len(pages),
+        "concept_ids": [f"{page.bundle}/{page.rel_path}" for page in pages],
+        # Scope, declared. A build that carried bundles over from a previous run has
+        # no vectors for them, so the index is partial — and an agent asking a
+        # question those bundles answer would get keyword-only ranking. Saying so is
+        # what lets the plugin report it instead of implying the whole corpus is
+        # searchable semantically.
+        "complete": complete,
+        "bundles": sorted({page.bundle for page in pages}),
+        "text_chars": EMBED_TEXT_CHARS,
+        "built_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
 
 
 def write_embeddings(
@@ -1091,30 +1132,138 @@ def write_embeddings(
     flat = [value for vector in vectors for value in vector]
     (root / EMBEDDINGS_BIN).write_bytes(struct.pack(f"<{len(flat)}f", *flat))
     (root / EMBEDDINGS_JSON).write_text(
-        json.dumps(
-            {
-                "schema": EMBEDDINGS_SCHEMA,
-                "model": model,
-                "dim": dim,
-                "count": len(vectors),
-                "concept_ids": [f"{page.bundle}/{page.rel_path}" for page in pages],
-                # Scope, declared. A build that carried bundles over from a previous
-                # run has no vectors for them, so the index is partial — and an agent
-                # asking a question those bundles answer would get keyword-only
-                # ranking. Saying so is what lets the plugin report it instead of
-                # implying the whole corpus is searchable semantically.
-                "complete": complete,
-                "bundles": sorted({page.bundle for page in pages}),
-                "text_chars": EMBED_TEXT_CHARS,
-                "built_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-            indent=1,
-            sort_keys=True,
-        )
-        + "\n",
+        json.dumps(embeddings_metadata(pages, model, dim, complete), indent=1, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     log(f"    wrote {EMBEDDINGS_JSON} ({len(vectors)} × {dim})")
+
+
+def read_corpus_pages(root: Path) -> list[Page]:
+    """
+    Every concept already on disk, for `--index-only`.
+
+    Reads what a previous build wrote instead of fetching anything. The OKF shape is
+    what this module emits, so frontmatter is the metadata and everything after it is
+    the body. A page without frontmatter is still a concept — the plugin counts it,
+    so the index has to cover it too, with empty metadata rather than a silent skip.
+    """
+    pages: list[Page] = []
+    for bundle_dir in sorted(root.iterdir()):
+        if not bundle_dir.is_dir():
+            continue
+        if bundle_dir.name.startswith(".") or bundle_dir.name.endswith(".requests"):
+            continue
+        for markdown in sorted(bundle_dir.rglob("*.md")):
+            text = markdown.read_text(encoding="utf-8", errors="replace")
+            front, body = strip_frontmatter(text)
+            tags = front.get("tags") or []
+            if not isinstance(tags, list):
+                tags = [tags]
+            pages.append(
+                Page(
+                    bundle=bundle_dir.name,
+                    rel_path=markdown.relative_to(bundle_dir).as_posix(),
+                    title=str(front.get("title") or ""),
+                    description=str(front.get("description") or ""),
+                    type=str(front.get("type") or ""),
+                    resource=str(front.get("resource") or ""),
+                    tags=[str(tag) for tag in tags],
+                    timestamp=str(front.get("timestamp") or ""),
+                    body=body,
+                )
+            )
+    return pages
+
+
+def index_corpus(
+    root: Path, endpoint: str, model: str, api_key: str, batch: int, log
+) -> tuple[int, int]:
+    """
+    Embed the corpus already at `root`, without fetching or rebuilding it.
+
+    A full build writes the index as a by-product of fetching. This exists because
+    re-fetching every source to add one vector per page is the wrong price, and
+    because rebuilding a corpus and rebuilding an index have to be separable before
+    anything can rebuild one without the other.
+
+    Resumable on purpose, and the journal is the same one the plugin's settings page
+    reads for its progress bar — so "a killed build starts again from zero" and "the
+    page cannot show progress" turn out to be the same missing file. On success the
+    partial matrix becomes `embeddings.bin` and the journal is removed; on failure
+    both stay, for the next run to resume from.
+    """
+    import struct
+
+    if not root.is_dir():
+        raise RuntimeError(f"no corpus at {root}")
+    pages = read_corpus_pages(root)
+    if not pages:
+        raise RuntimeError(f"no concepts found under {root}")
+    ids = [f"{page.bundle}/{page.rel_path}" for page in pages]
+
+    journal = root / EMBEDDINGS_JOURNAL
+    partial = root / EMBEDDINGS_PARTIAL
+
+    done = 0
+    dim = 0
+    if journal.is_file() and partial.is_file():
+        seen = [line for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+        size = partial.stat().st_size
+        # Resume only when the journal is a prefix of *this* corpus and the matrix is
+        # exactly that many vectors long. Anything else is a journal from a different
+        # corpus: starting over costs time, trusting it costs the index.
+        if seen and seen == ids[: len(seen)] and size > 0 and size % (len(seen) * 4) == 0:
+            dim = size // (len(seen) * 4)
+            done = len(seen)
+            log(f"  resuming after {done}/{len(pages)} concept(s)")
+
+    handle = open(partial, "ab" if done else "wb")
+
+    def journal_batch(start: int, vectors: list[list[float]]) -> None:
+        nonlocal dim
+        for offset, vector in enumerate(vectors):
+            index = done + start + offset
+            if dim == 0:
+                dim = len(vector)
+            if len(vector) != dim:
+                raise RuntimeError(
+                    "the embedding endpoint changed dimensions mid-run; "
+                    "a ragged matrix cannot be searched"
+                )
+            handle.write(struct.pack(f"<{len(vector)}f", *vector))
+            with open(journal, "a", encoding="utf-8") as lines:
+                lines.write(f"{ids[index]}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    try:
+        embed_texts(
+            endpoint,
+            model,
+            api_key,
+            [concept_text(page) for page in pages[done:]],
+            batch,
+            log,
+            on_batch=journal_batch,
+        )
+    finally:
+        handle.close()
+
+    size = partial.stat().st_size
+    if dim == 0 or size != len(pages) * dim * 4:
+        raise RuntimeError(
+            f"the journal is inconsistent: {size} bytes for {len(pages)} × {dim} floats; "
+            f"delete {EMBEDDINGS_JOURNAL} and {EMBEDDINGS_PARTIAL} and index again"
+        )
+
+    partial.replace(root / EMBEDDINGS_BIN)
+    (root / EMBEDDINGS_JSON).write_text(
+        json.dumps(embeddings_metadata(pages, model, dim, True), indent=1, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    journal.unlink(missing_ok=True)
+    log(f"  wrote {EMBEDDINGS_JSON} ({len(pages)} × {dim})")
+    return len(pages), dim
 
 
 def local_root(source: Source, local_root_dir: Path) -> Path:
@@ -1301,11 +1450,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embed-model", default="", help="model name to send")
     parser.add_argument("--embed-batch", type=int, default=64)
     parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="embed the corpus already at --out, without fetching or rebuilding it",
+    )
+    parser.add_argument(
         "--local-root",
         default=".",
         help="where a `kind: local` source's relative folder resolves (default: the working directory)",
     )
     args = parser.parse_args(argv)
+
+    if args.index_only:
+        # `--sources` is not read at all in this mode: rebuilding an index must not
+        # depend on a source list being present or intact, since nothing is fetched.
+        if not args.embed_endpoint or not args.embed_model:
+            print("--index-only needs --embed-endpoint and --embed-model", file=sys.stderr)
+            return 2
+
+        def index_log(message: str) -> None:
+            print(message, flush=True)
+
+        try:
+            count, dim = index_corpus(
+                Path(args.out).expanduser(),
+                args.embed_endpoint,
+                args.embed_model,
+                os.environ.get("PAPERCLIP_DOCS_EMBED_KEY", ""),
+                args.embed_batch,
+                index_log,
+            )
+        except RuntimeError as error:
+            print(f"  index-only failed: {error}", file=sys.stderr)
+            return 1
+        print(f"index: {count} concept(s), {dim} dimensions, model {args.embed_model}")
+        return 0
 
     sources, global_exclude, defaults = load_sources(Path(args.sources))
     all_sources = list(sources)  # before --bundle narrowing; needed for carry-over

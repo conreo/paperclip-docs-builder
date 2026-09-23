@@ -45,6 +45,7 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -72,6 +73,9 @@ def requests_dir_for(corpus_root: Path) -> Path:
     return corpus_root.with_name(corpus_root.name + ".requests")
 #: The schema this runner understands. A newer plugin must not be silently ignored.
 SUPPORTED_SCHEMA = 1
+#: The halves of the pipeline a request can ask for. `index` deliberately fetches
+#: nothing, so it can run against a corpus whose sources are long gone.
+MODES = ("okf", "index", "both")
 #: Requests are renamed rather than deleted: an operator chasing a failure needs
 #: the exact document that caused it.
 DONE_SUFFIX = ".done"
@@ -89,10 +93,17 @@ class Outcome:
     corpus_root: str = ""
     pages: int = 0
     bundles: int = 0
+    #: What the vector index now holds, when the request asked for one. Its own field
+    #: rather than part of `reason` because the settings page shows the counts.
+    index: dict = dataclasses.field(default_factory=dict)
     error: str = ""
 
     def as_dict(self) -> dict:
-        return {k: v for k, v in dataclasses.asdict(self).items() if v not in ("", 0)}
+        return {
+            key: value
+            for key, value in dataclasses.asdict(self).items()
+            if value not in ("", 0) and value != {} and value != []
+        }
 
 
 def now_iso() -> str:
@@ -117,6 +128,26 @@ def corpus_built_at(corpus_root: Path) -> str:
     return value if isinstance(value, str) else ""
 
 
+def request_mode(request: dict) -> str:
+    """
+    Which half of the pipeline a request asks for.
+
+    `okf` builds the corpus and nothing else, `index` rebuilds the vector index from
+    the corpus already on disk, `both` does the two in one pass.
+
+    A request carrying an embed block but naming no mode is `both` — that is the
+    shape the plugin sends once an operator has asked for semantic retrieval — and a
+    request with neither is `okf`, which is what every request meant before modes
+    existed. Defaulting the other way would make an old plugin's requests suddenly
+    try to embed.
+    """
+    mode = request.get("mode")
+    if isinstance(mode, str) and mode.strip():
+        return mode.strip()
+    embed = request.get("embed")
+    return "both" if isinstance(embed, dict) and embed else "okf"
+
+
 def validate_request(request: dict) -> str:
     """Return a refusal reason, or "" when the request is usable."""
     schema = request.get("schema")
@@ -127,6 +158,29 @@ def validate_request(request: dict) -> str:
         )
     if not isinstance(request.get("corpusRoot"), str) or not request["corpusRoot"].strip():
         return "request has no corpusRoot"
+
+    mode = request_mode(request)
+    if mode not in MODES:
+        return f"mode {mode!r} is not one this runner understands ({', '.join(MODES)})"
+
+    if mode in ("index", "both"):
+        embed = request.get("embed")
+        if not isinstance(embed, dict):
+            return f"mode {mode!r} needs an embed block naming an endpoint and a model"
+        endpoint = embed.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            return "embed.endpoint is missing"
+        if not re.match(r"^https?://", endpoint.strip()):
+            return "embed.endpoint must be an http(s) URL"
+        if not isinstance(embed.get("model"), str) or not embed["model"].strip():
+            return "embed.model is missing"
+
+    if mode == "index":
+        # The corpus is already on disk, so no registry is involved — which is the
+        # point. Rebuilding an index must not depend on the sources that built the
+        # corpus still existing, still resolving, or still being declared.
+        return ""
+
     sources = request.get("sources")
     if not isinstance(sources, list) or not sources:
         return "request declares no sources"
@@ -170,6 +224,50 @@ def builder_config(sources: list[dict]) -> dict:
     return out
 
 
+def embed_args(embed: dict) -> list[str]:
+    """The builder's embedding flags for one request."""
+    return [
+        "--embed-endpoint", str(embed.get("endpoint", "")).strip(),
+        "--embed-model", str(embed.get("model", "")).strip(),
+        "--embed-batch", str(int(embed.get("batch") or 64)),
+    ]
+
+
+def index_summary(root: Path) -> dict:
+    """What the index at `root` now holds, for `response.json` — or {} when none."""
+    summary = read_json(root / fetch.EMBEDDINGS_JSON) or {}
+    return {key: summary[key] for key in ("model", "dim", "count", "complete") if key in summary}
+
+
+def rebuild_index(root: Path, embed: dict, requested_at: str, log) -> Outcome:
+    """
+    `mode: index` — embed the corpus already on disk, fetching nothing.
+
+    Separate from the build path on purpose: `--index-only` does not read the source
+    registry at all, so an index can be rebuilt after sources have moved, changed
+    shape, or been removed from the plugin's configuration.
+    """
+    log(f"  indexing {root}")
+    code = fetch.main(["--index-only", "--out", str(root), *embed_args(embed)])
+    if code != 0:
+        return Outcome(
+            status="failed",
+            reason="the index build failed",
+            requested_at=requested_at,
+            finished_at=now_iso(),
+            corpus_root=str(root),
+            error=f"the builder exited {code}",
+        )
+    return Outcome(
+        status="built",
+        reason="index rebuilt",
+        requested_at=requested_at,
+        finished_at=now_iso(),
+        corpus_root=str(root),
+        index=index_summary(root),
+    )
+
+
 def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
     """
     Do the work for one pending request.
@@ -208,6 +306,17 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
     declared_root = Path(str(request["corpusRoot"])).expanduser()
     root = declared_root if declared_root.is_absolute() else corpus_root
 
+    mode = request_mode(request)
+    embed = request.get("embed") if isinstance(request.get("embed"), dict) else {}
+
+    if mode == "index":
+        # No corpus build, so the "already built after this request" skip below does
+        # not apply: the corpus being fresh says nothing about whether its index is.
+        outcome = rebuild_index(root, embed, requested_at, log)
+        suffix = DONE_SUFFIX if outcome.status == "built" else FAILED_SUFFIX
+        request_path.rename(request_path.with_name(request_path.name + suffix))
+        return outcome
+
     built_at = corpus_built_at(root)
     if built_at and requested_at and built_at >= requested_at:
         # Already newer than the request. A cron and a button can race, and this is
@@ -236,6 +345,10 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
                 # One job at a time: this process may be one of several on a host,
                 # and the builder's swap is atomic but the checkout cache is shared.
                 "--jobs", "2",
+                # Only when the request asked for both: a corpus rebuild writes its
+                # index into staging so the two are promoted together, which is the
+                # one ordering that cannot leave a corpus newer than its index.
+                *(embed_args(embed) if mode == "both" else []),
             ]
         )
 
@@ -261,6 +374,9 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
         corpus_root=str(root),
         pages=int((totals or {}).get("pages") or 0),
         bundles=int((totals or {}).get("bundles") or 0),
+        # Reported whatever the mode: if a `both` request embedded the corpus, the
+        # page should be able to say how many vectors the rebuild left behind.
+        index=index_summary(root),
     )
 
 
