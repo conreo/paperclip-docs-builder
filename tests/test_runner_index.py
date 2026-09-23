@@ -163,6 +163,45 @@ class RunnerIndexTest(unittest.TestCase):
         self.assertIn("everything", response["reason"])
         self.assertIn("index", response["reason"])
 
+    def test_a_path_the_host_cannot_see_falls_back_to_the_runners_own_out(self):
+        self.write_request(
+            {
+                "schema": 1,
+                "requestedAt": "2026-09-23T00:00:00Z",
+                "reason": "test",
+                # The container's view of the corpus, which does not exist here.
+                "corpusRoot": "/paperclip/offline-docs/okf-bundles",
+                "mode": "index",
+                "embed": self.embed_block(),
+            }
+        )
+        self.assertEqual(self.run_once(), 0)
+
+        response = self.response()
+        self.assertEqual(response["status"], "built")
+        # Built where the runner was told the corpus is, and said so rather than
+        # silently pretending the two paths are the same thing.
+        self.assertEqual(response["corpus_root"], str(self.corpus))
+        self.assertIn("cannot see", response["reason"])
+        self.assertTrue((self.corpus / fetch.EMBEDDINGS_JSON).is_file())
+
+    def test_a_path_the_host_can_see_is_still_honoured(self):
+        self.write_request(
+            {
+                "schema": 1,
+                "requestedAt": "2026-09-23T00:00:00Z",
+                "reason": "test",
+                "corpusRoot": str(self.corpus),
+                "mode": "index",
+                "embed": self.embed_block(),
+            }
+        )
+        self.assertEqual(self.run_once(), 0)
+
+        response = self.response()
+        self.assertEqual(response["status"], "built")
+        self.assertNotIn("cannot see", response["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

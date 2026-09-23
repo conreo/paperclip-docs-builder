@@ -239,7 +239,7 @@ def index_summary(root: Path) -> dict:
     return {key: summary[key] for key in ("model", "dim", "count", "complete") if key in summary}
 
 
-def rebuild_index(root: Path, embed: dict, requested_at: str, log) -> Outcome:
+def rebuild_index(root: Path, embed: dict, requested_at: str, log, note: str = "") -> Outcome:
     """
     `mode: index` — embed the corpus already on disk, fetching nothing.
 
@@ -260,7 +260,7 @@ def rebuild_index(root: Path, embed: dict, requested_at: str, log) -> Outcome:
         )
     return Outcome(
         status="built",
-        reason="index rebuilt",
+        reason="index rebuilt" + (f" — {note}" if note else ""),
         requested_at=requested_at,
         finished_at=now_iso(),
         corpus_root=str(root),
@@ -303,8 +303,26 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
 
     # The request names where the corpus belongs; the runner's own --out is the
     # fallback so a misconfigured plugin cannot scatter corpora around the host.
+    #
+    # It is also the fix for a namespace difference. The plugin writes the path as
+    # *its worker* sees it, and a plugin running in a container sees `/paperclip/…`
+    # where the host has a volume path — so an absolute path the runner cannot
+    # resolve is not a different corpus, it is the same corpus described from
+    # somewhere else. The runner's --out is the operator's own statement of where the
+    # corpus is, so that wins when the declared path is not there.
     declared_root = Path(str(request["corpusRoot"])).expanduser()
-    root = declared_root if declared_root.is_absolute() else corpus_root
+    relocated = ""
+    if not declared_root.is_absolute():
+        root = corpus_root
+    elif declared_root.is_dir():
+        root = declared_root
+    else:
+        root = corpus_root
+        relocated = (
+            f"the request names {declared_root}, which this host cannot see; "
+            f"used {corpus_root}"
+        )
+        log(f"  note  {relocated}")
 
     mode = request_mode(request)
     embed = request.get("embed") if isinstance(request.get("embed"), dict) else {}
@@ -312,7 +330,7 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
     if mode == "index":
         # No corpus build, so the "already built after this request" skip below does
         # not apply: the corpus being fresh says nothing about whether its index is.
-        outcome = rebuild_index(root, embed, requested_at, log)
+        outcome = rebuild_index(root, embed, requested_at, log, relocated)
         suffix = DONE_SUFFIX if outcome.status == "built" else FAILED_SUFFIX
         request_path.rename(request_path.with_name(request_path.name + suffix))
         return outcome
@@ -368,7 +386,8 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
     request_path.rename(request_path.with_name(request_path.name + DONE_SUFFIX))
     return Outcome(
         status="built",
-        reason="built" if not stale else f"built; kept stale bundles: {', '.join(stale)}",
+        reason=("built" if not stale else f"built; kept stale bundles: {', '.join(stale)}")
+        + (f" — {relocated}" if relocated else ""),
         requested_at=requested_at,
         finished_at=now_iso(),
         corpus_root=str(root),
