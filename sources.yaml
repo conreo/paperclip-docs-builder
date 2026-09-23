@@ -23,6 +23,14 @@ version: 1
 global_exclude:
   - "**/node_modules/**"
   - "**/.github/**"
+  # Include fragments and partials, not pages. n8n ships its GitBook snippets as
+  # `reusable-content/.gitbook/includes/…` — transcluded fragments that read as
+  # broken pages on their own, and 156 of them landed in the corpus as concepts.
+  - "**/.gitbook/**"
+  - "**/_includes/**"
+  - "**/_partials/**"
+  - "**/_snippets/**"
+
   # A repository's own root README is contributor-facing — build badges, how to
   # open a pull request — not documentation. Nested READMEs are a different thing
   # entirely: in n8n and Nextcloud they are the real content page for a directory,

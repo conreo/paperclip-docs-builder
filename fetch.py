@@ -40,7 +40,6 @@ import argparse
 import concurrent.futures
 import dataclasses
 import datetime as dt
-import fnmatch
 import json
 import os
 import re
@@ -169,13 +168,46 @@ class Page:
     tags: list[str]
     timestamp: str
     body: str
+    # Rendered once, when the source is built, and reused when the bundle is
+    # written. Rendering twice for a byte count was pure waste on 4,000 pages.
+    rendered: str = ""
+
+
+@dataclasses.dataclass
+class FilterCounts:
+    """
+    What the filters removed, by reason.
+
+    Reported in the manifest because the filters are the point of owning this
+    pipeline: a corpus that cannot say what it excluded cannot be tuned, and the
+    first version counted none of these — files dropped by a glob simply vanished.
+    """
+
+    glob: int = 0
+    locale: int = 0
+    oversized: int = 0
+    unreadable: int = 0
+    empty: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.glob + self.locale + self.oversized + self.unreadable + self.empty
+
+    def as_dict(self) -> dict:
+        return {
+            "by_glob": self.glob,
+            "by_locale": self.locale,
+            "oversized": self.oversized,
+            "unreadable": self.unreadable,
+            "empty": self.empty,
+            "total": self.total,
+        }
 
 
 @dataclasses.dataclass
 class SourceResult:
     name: str
     ok: bool
-    stale: bool = False
     error: str = ""
     commit: str = ""
     ref: str = ""
@@ -183,7 +215,7 @@ class SourceResult:
     commit_date: str = ""
     pages: int = 0
     bytes: int = 0
-    skipped: int = 0
+    counts: "FilterCounts" = dataclasses.field(default_factory=FilterCounts)
     collisions: int = 0
     seconds: float = 0.0
     warnings: list[str] = dataclasses.field(default_factory=list)
@@ -445,16 +477,9 @@ def output_path_for(rel_path: str) -> str:
     return re.sub(r"\.(mdx|rst)$", ".md", rel_path)
 
 
-def index_for(directory: str, subdirectories: list[str], pages: list[tuple[str, str]]) -> str:
-    """
-    A navigation page for one directory.
-
-    The plugin treats `index.md` as navigation: `list_docs` returns it for that
-    level and it needs no frontmatter. One per directory is what makes browsing
-    progressive instead of a flat dump of a thousand pages.
-    """
-    title = directory.rstrip("/").rsplit("/", 1)[-1] or "Documentation"
-    lines = [f"# {title.replace('-', ' ').replace('_', ' ').title()}", ""]
+def navigation_body(subdirectories: list[str], pages: list[tuple[str, str]]) -> str:
+    """The `Sections` and `Pages` lists, with no heading of their own."""
+    lines: list[str] = []
     if subdirectories:
         lines += ["## Sections", ""]
         lines += [f"* [{child.replace('-', ' ').title()}]({child}/)" for child in subdirectories]
@@ -463,7 +488,21 @@ def index_for(directory: str, subdirectories: list[str], pages: list[tuple[str, 
         lines += ["## Pages", ""]
         lines += [f"* [{label}]({target})" for label, target in pages]
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
+
+
+def index_for(directory: str, subdirectories: list[str], pages: list[tuple[str, str]]) -> str:
+    """
+    A navigation page for one directory, for directories the source has no page for.
+
+    The plugin treats `index.md` as navigation: `list_docs` returns it for that
+    level. One per directory is what makes browsing progressive instead of a flat
+    dump of a thousand pages.
+    """
+    label = directory.rstrip("/").rsplit("/", 1)[-1]
+    title = label.replace("-", " ").replace("_", " ").title() if label else "Documentation"
+    body = navigation_body(subdirectories, pages)
+    return f"# {title}\n\n{body}\n" if body else f"# {title}\n"
 
 
 # ---------------------------------------------------------------------- adapters
@@ -480,14 +519,24 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: int = 900) -> str:
 
 
 def normalise_date(raw: str) -> str:
-    """A UTC `Z` timestamp, which is what the corpus's own dates look like."""
+    """
+    A UTC `Z` timestamp, which is what the corpus's own dates look like.
+
+    Returns "" when the input is not a date, rather than substituting the build
+    time. `sources` reports corpus age from these, so a date fabricated at build
+    time would make a stale snapshot look fresh — the one failure this field
+    exists to prevent. Callers fall back to the source's real snapshot date.
+    """
     try:
-        parsed = dt.datetime.fromisoformat(raw.strip())
+        # `Z` and `z` are both valid RFC 3339, and neither is understood by
+        # `fromisoformat` before Python 3.11 — normalise it rather than depend on
+        # the interpreter's version.
+        parsed = dt.datetime.fromisoformat(re.sub(r"[Zz]$", "+00:00", raw.strip()))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=dt.timezone.utc)
         return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
-        return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return ""
 
 
 def age_in_days(timestamp: str) -> int | None:
@@ -514,6 +563,20 @@ def git_clone(source: Source, workdir: Path, log) -> tuple[Path, str, str, bool]
     pinned = bool(source.ref)
     ref = source.ref
 
+    # The cache is keyed by source name, which is not the same thing as the
+    # repository. Reusing a checkout after `repo` changed silently built from the
+    # old upstream and recorded its commit as provenance — a relocation, which is
+    # the drift this builder exists to catch, would have been invisible.
+    cached_remote = ""
+    if (target / ".git").is_dir():
+        try:
+            cached_remote = run(["git", "config", "--get", "remote.origin.url"], cwd=target).strip()
+        except RuntimeError:
+            cached_remote = ""
+    if (target / ".git").is_dir() and cached_remote != source.repo:
+        log(f"    checkout was {cached_remote or 'unknown'}, re-cloning for {source.repo}")
+        shutil.rmtree(target, ignore_errors=True)
+
     if not (target / ".git").is_dir():
         shutil.rmtree(target, ignore_errors=True)
         cmd = ["git", "clone", "--quiet", "--depth", "1", "--single-branch"]
@@ -536,6 +599,10 @@ def git_clone(source: Source, workdir: Path, log) -> tuple[Path, str, str, bool]
         try:
             run(["git", "fetch", "--quiet", "--depth", "1", "origin", branch], cwd=target)
             run(["git", "reset", "--quiet", "--hard", "FETCH_HEAD"], cwd=target)
+            if source.path:
+                # A changed `path` needs materialising; the cached sparse config
+                # still describes the old one.
+                run(["git", "sparse-checkout", "set", source.path], cwd=target)
         except RuntimeError:
             if pinned:
                 raise
@@ -546,7 +613,7 @@ def git_clone(source: Source, workdir: Path, log) -> tuple[Path, str, str, bool]
     if not pinned:
         branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=target).strip()
         ref = branch if branch and branch != "HEAD" else (ref or "default")
-    return target, commit, normalise_date(date), pinned
+    return target, commit, normalise_date(date) or date.strip(), pinned
 
 
 def iter_git_files(source: Source, checkout: Path):
@@ -558,7 +625,9 @@ def iter_git_files(source: Source, checkout: Path):
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if ".git/" in str(path) or "/.git" in str(path):
+        # Match the `.git` directory by path component. A substring test also
+        # matches `.github`, which silently dropped those files.
+        if ".git" in path.relative_to(checkout).parts:
             continue
         rel = path.relative_to(checkout).as_posix()
         found.append((rel, path))
@@ -633,13 +702,18 @@ def convert_with_pandoc(text: str, source: Source) -> str:
 
 
 def build_pages(
-    source: Source, checkout: Path | None, log, limit: int = 0, timestamp_default: str = ""
-) -> tuple[list[Page], int, int]:
+    source: Source,
+    checkout: Path | None,
+    log,
+    limit: int = 0,
+    timestamp_default: str = "",
+    warnings: list[str] | None = None,
+) -> tuple[list[Page], FilterCounts, int]:
     """
     Turn a source's files into concepts.
 
-    Returns (pages, skipped, collisions). Skipping is normal and reported: it is
-    how filters and size caps show up in the manifest instead of silently
+    Returns (pages, counts, collisions). Skipping is normal and counted by reason:
+    that is how filters and size caps show up in the manifest instead of silently
     disappearing.
 
     `timestamp_default` is the source's snapshot date — the commit date for a
@@ -650,12 +724,16 @@ def build_pages(
         "%Y-%m-%dT%H:%M:%SZ"
     )
     candidates: list[tuple[str, str, str]] = []  # rel, title_hint, body
-    oversized = 0
+    counts = FilterCounts()
 
     if source.kind == "llms":
         text, _, warning = fetch_llms(source, log)
         if not text:
             raise RuntimeError(warning or "llms source unavailable")
+        if warning and warnings is not None:
+            # e.g. LINE's llms-full.txt answers 403, so the bundle silently came
+            # from llms.txt instead. That belongs in the manifest.
+            warnings.append(warning)
         if source.split == "h2":
             for title, body in split_by_h2(text):
                 label = title or source.title
@@ -666,36 +744,37 @@ def build_pages(
         assert checkout is not None
         for rel, absolute in iter_git_files(source, checkout):
             if not should_include(rel, source):
+                counts.glob += 1
                 continue
             if source.drop_locales and is_locale_path(rel):
+                counts.locale += 1
                 continue
             try:
                 size = absolute.stat().st_size
             except OSError:
+                counts.unreadable += 1
                 continue
             if size > source.max_file_bytes:
-                oversized += 1
+                counts.oversized += 1
                 continue
             try:
                 raw = absolute.read_text(encoding="utf-8", errors="replace")
             except OSError:
+                counts.unreadable += 1
                 continue
             candidates.append((rel, "", raw))
 
     pages: list[Page] = []
-    skipped = oversized
     collisions = 0
     seen: dict[str, str] = {}
 
     for rel, title_hint, raw in candidates:
         if not raw.strip():
-            skipped += 1
+            counts.empty += 1
             continue
         frontmatter, body = strip_frontmatter(raw)
         suffix = Path(rel).suffix.lower()
-        if source.kind == "llms":
-            pass
-        elif source.convert == "rst" or suffix == ".rst":
+        if source.convert == "rst" or suffix == ".rst":
             try:
                 body = convert_with_pandoc(body, source)
             except RuntimeError as error:
@@ -707,7 +786,7 @@ def build_pages(
         body = normalise_markdown(body)
         heading = first_heading(body)
         if not heading and not title_hint and len(body.strip()) < 40:
-            skipped += 1
+            counts.empty += 1
             continue
 
         # The declared `path` is a slice of the repository, not part of the bundle:
@@ -744,9 +823,9 @@ def build_pages(
             break
 
     if source.max_pages and len(pages) > source.max_pages:
-        skipped += len(pages) - source.max_pages
+        counts.oversized += len(pages) - source.max_pages
         pages = pages[: source.max_pages]
-    return pages, skipped, collisions
+    return pages, counts, collisions
 
 
 def slugify(text: str) -> str:
@@ -758,43 +837,77 @@ def slugify(text: str) -> str:
 
 
 def write_bundle(staging: Path, source: Source, pages: list[Page]) -> int:
-    """Write one bundle and its navigation pages. Returns bytes written."""
+    """
+    Write one bundle: its concepts, then navigation for every directory.
+
+    A source's own landing page (`index.md` for a directory) *is* that directory's
+    navigation. The first version wrote it and then overwrote it with a generated
+    listing — 525 real pages across these sources were destroyed, and each index
+    listed itself as one of its own children. Where the source has a landing page
+    its content is kept, as a normal concept with its frontmatter, and the
+    generated sections are appended underneath it.
+    """
     bundle_dir = staging / source.name
     bundle_dir.mkdir(parents=True, exist_ok=True)
     total = 0
 
-    # One navigation tree for the whole bundle, built from the pages rather than
-    # from whatever directories happened to be visited. The first version keyed
-    # indexes off each page's immediate parent, so a bundle whose pages are all
-    # nested — n8n, where every page is under `docs/` — got no root index at all,
-    # and `list_docs` at the bundle level fell back to a synthetic listing.
+    # 1. The concepts themselves. `index.md` is skipped here because it is that
+    #    directory's navigation page and is written in step 3.
+    for page in pages:
+        if page.rel_path == INDEX_FILENAME or page.rel_path.endswith("/" + INDEX_FILENAME):
+            continue
+        target = bundle_dir / page.rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rendered = page.rendered or render_concept(page)
+        target.write_text(rendered, encoding="utf-8")
+        total += len(rendered.encode("utf-8"))
+
+    # 2. The navigation tree, built from the pages rather than from whatever
+    #    directories happened to be visited.
+    landing: dict[str, Page] = {}
     tree: dict[str, dict[str, set | list]] = {"": {"dirs": set(), "pages": []}}
 
     for page in pages:
         parts = page.rel_path.split("/")
-        target = bundle_dir / page.rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        rendered = render_concept(page)
-        target.write_text(rendered, encoding="utf-8")
-        total += len(rendered.encode("utf-8"))
-
+        directory = "/".join(parts[:-1])
+        if parts[-1] == INDEX_FILENAME:
+            landing[directory] = page
+            continue
         for depth in range(len(parts)):
             tree.setdefault("/".join(parts[:depth]), {"dirs": set(), "pages": []})
-        tree["/".join(parts[:-1])]["pages"].append((page.title, parts[-1]))  # type: ignore[union-attr]
+        tree[directory]["pages"].append((page.title, parts[-1]))  # type: ignore[union-attr]
         for depth in range(len(parts) - 1):
             tree["/".join(parts[:depth])]["dirs"].add(parts[depth])  # type: ignore[union-attr]
 
+    # A directory that exists only because a landing page lives in it still needs
+    # a node, and still needs to appear in its parent's listing.
+    for directory in landing:
+        parts = directory.split("/") if directory else []
+        for depth in range(len(parts) + 1):
+            tree.setdefault("/".join(parts[:depth]), {"dirs": set(), "pages": []})
+        for depth in range(len(parts)):
+            tree["/".join(parts[:depth])]["dirs"].add(parts[depth])  # type: ignore[union-attr]
+
+    # 3. One navigation page per directory. Where the source has its own landing
+    #    page, that page *is* the navigation, so its content is kept and the
+    #    generated sections are appended underneath it.
     for directory, node in tree.items():
+        subdirectories = sorted(node["dirs"])  # type: ignore[arg-type]
+        children = sorted(node["pages"], key=lambda item: item[1])  # type: ignore[arg-type]
         target = bundle_dir / directory / INDEX_FILENAME if directory else bundle_dir / INDEX_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            index_for(
-                directory,
-                sorted(node["dirs"]),  # type: ignore[arg-type]
-                sorted(node["pages"], key=lambda item: item[1]),  # type: ignore[arg-type]
-            ),
-            encoding="utf-8",
-        )
+
+        existing = landing.get(directory)
+        if existing is None:
+            rendered = index_for(directory, subdirectories, children)
+        else:
+            navigation = navigation_body(subdirectories, children)
+            body = existing.body.rstrip()
+            rendered = render_concept(
+                dataclasses.replace(existing, body=f"{body}\n\n{navigation}\n" if navigation else body)
+            )
+        target.write_text(rendered, encoding="utf-8")
+        total += len(rendered.encode("utf-8"))
     return total
 
 
@@ -802,6 +915,7 @@ def build_source(source, workdir, log, limit=0):
     """Fetch and convert one source. Never raises: failures become results."""
     started = time.monotonic()
     result = SourceResult(name=source.name, ok=False)
+    warnings: list[str] = []
     try:
         if source.kind in ("git", "wiki"):
             if not source.repo:
@@ -814,19 +928,31 @@ def build_source(source, workdir, log, limit=0):
             # The commit date becomes every concept's timestamp: `sources` then
             # reports the age of the *documentation*, which is the number an agent
             # needs to judge whether an answer is still true.
-            pages, skipped, collisions = build_pages(
-                source, checkout, log, limit, timestamp_default=date
+            pages, counts, collisions = build_pages(
+                source, checkout, log, limit, timestamp_default=date, warnings=warnings
             )
         elif source.kind == "llms":
             log(f"  {source.name}: {source.url}")
             result.commit_date = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            pages, skipped, collisions = build_pages(source, None, log, limit)
+            pages, counts, collisions = build_pages(source, None, log, limit, warnings=warnings)
         else:
             raise RuntimeError(f"unknown kind '{source.kind}'")
+        if not pages:
+            # A source whose globs now match nothing used to report success and
+            # overwrite its bundle with an index-only stub. That is the drift case
+            # this design exists for, so it must fail and keep the previous bundle.
+            raise RuntimeError(
+                f"no pages matched ({counts.total} file(s) seen and filtered out). "
+                "Check include/exclude globs, the declared path, and the ref — an "
+                "empty result is treated as a failure so the previous bundle survives."
+            )
+        for page in pages:
+            page.rendered = render_concept(page)
+        result.warnings = list(warnings)
         result.pages_data = pages
         result.pages = len(pages)
-        result.bytes = sum(len(render_concept(page).encode("utf-8")) for page in pages)
-        result.skipped = skipped
+        result.bytes = sum(len(page.rendered.encode("utf-8")) for page in pages)
+        result.counts = counts
         result.collisions = collisions
         result.ok = True
     except Exception as error:  # a broken source must not cost the other thirteen
@@ -858,14 +984,15 @@ def swap_into_place(staging: Path, root: Path, keep_previous: bool, log) -> None
     os.replace(staging, root)
 
 
-def load_sources(path: Path) -> tuple[list[Source], list[str]]:
+def load_sources(path: Path) -> tuple[list[Source], list[str], dict]:
+    """The sources, the global excludes, and the defaults they were built from."""
     config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     defaults = config.get("defaults") or {}
     global_exclude = [str(p) for p in (config.get("global_exclude") or [])]
     sources = []
     for name, raw in (config.get("sources") or {}).items():
         sources.append(Source.from_config(name, raw, defaults, global_exclude))
-    return sources, global_exclude
+    return sources, global_exclude, defaults
 
 
 def check_sources(sources: list[Source]) -> int:
@@ -879,7 +1006,11 @@ def check_sources(sources: list[Source]) -> int:
                 # repository is at least reachable. Fetching whole trees to check
                 # would make --check as slow as the build it is meant to precede.
                 out = run(["git", "ls-remote", source.repo, source.ref or "HEAD"], timeout=90)
-                sha = out.split()[0] if out.split() else "?"
+                if not out.split():
+                    # git exits 0 with no output for a ref that does not exist, so
+                    # a typo'd pin used to print `ok … ?` and fail silently later.
+                    raise RuntimeError(f"ref '{source.ref}' does not exist in {source.repo}")
+                sha = out.split()[0]
                 pin = source.ref or "default branch"
                 print(f"  ok    {label} {pin:<18} {sha[:12]}  {source.repo}")
             elif source.kind == "llms":
@@ -907,7 +1038,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=4)
     args = parser.parse_args(argv)
 
-    sources, global_exclude = load_sources(Path(args.sources))
+    sources, global_exclude, defaults = load_sources(Path(args.sources))
     all_sources = list(sources)  # before --bundle narrowing; needed for carry-over
     if args.bundle:
         wanted = set(args.bundle)
@@ -961,7 +1092,7 @@ def main(argv: list[str] | None = None) -> int:
                     log(
                         f"  done  {source.name:<14} {result.pages:>6} pages  "
                         f"{result.bytes / 1024:>8.0f} KB  {result.seconds}s"
-                        + (f"  ({result.skipped} skipped)" if result.skipped else "")
+                        + (f"  ({result.counts.total} filtered)" if result.counts.total else "")
                     )
                 else:
                     log(f"  FAIL  {source.name:<14} {result.error}")
@@ -971,6 +1102,7 @@ def main(argv: list[str] | None = None) -> int:
         stale: list[str] = []
         stale_upstreams: list[str] = []
         built_pages = 0
+        built_bundles = 0
         totals = {"bundles": 0, "pages": 0, "bytes": 0}
 
         for result in results:
@@ -987,7 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
                 "note": source.note,
                 "pages": result.pages,
                 "bytes": result.bytes,
-                "skipped": result.skipped,
+                "filters": result.counts.as_dict(),
                 "collisions": result.collisions,
                 "stale": False,
                 "error": None,
@@ -1008,6 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
             if result.ok:
                 write_bundle(staging, source, result.pages_data)
                 totals["bundles"] += 1
+                built_bundles += 1
                 built_pages += result.pages
                 totals["pages"] += result.pages
                 totals["bytes"] += result.bytes
@@ -1018,10 +1151,22 @@ def main(argv: list[str] | None = None) -> int:
                 previous_bundle = out_root / result.name
                 if previous_bundle.is_dir():
                     shutil.copytree(previous_bundle, staging / result.name)
+                    # Keep the provenance of the bundle that is actually being
+                    # served. Building the entry fresh left a kept bundle claiming
+                    # commit "" and 0 pages — the opposite of the point.
+                    kept = previous_manifest_sources.get(result.name) or {}
+                    for key in ("commit", "commit_date", "ref", "pinned", "pages", "bytes"):
+                        if kept.get(key) not in (None, ""):
+                            entry[key] = kept[key]
                     entry["stale"] = True
                     entry["error"] = result.error
                     stale.append(result.name)
-                    log(f"  stale {result.name:<14} kept the previous bundle ({result.error})")
+                    totals["pages"] += int(kept.get("pages") or 0)
+                    totals["bytes"] += int(kept.get("bytes") or 0)
+                    log(
+                        f"  stale {result.name:<14} kept the previous bundle from "
+                        f"{str(kept.get('commit') or '?')[:8]} ({result.error})"
+                    )
                 else:
                     entry["error"] = result.error
             manifest_sources[result.name] = entry
@@ -1054,6 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest_sources[source.name] = entry
             # Counted in the corpus, not in "built this run": the summary line
             # answers what this invocation did, the manifest describes what exists.
+            totals["bundles"] += 1
             totals["pages"] += int(entry.get("pages") or 0)
             totals["bytes"] += int(entry.get("bytes") or 0)
         if carried:
@@ -1073,8 +1219,11 @@ def main(argv: list[str] | None = None) -> int:
             },
             "filters": {
                 "global_exclude": global_exclude,
-                "drop_locales": True,
-                "max_file_bytes_default": 262144,
+                # The configured defaults, not literals. Hardcoding these made the
+                # manifest state a policy that no longer matched the config.
+                "drop_locales_default": bool(defaults.get("drop_locales", True)),
+                "max_file_bytes_default": int(defaults.get("max_file_bytes", 262144)),
+                "convert_default": defaults.get("convert", "auto"),
             },
         }
         (staging / MANIFEST_FILENAME).write_text(
@@ -1089,7 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = round(time.monotonic() - started, 1)
     carried_note = f" + {len(carried)} carried over" if carried else ""
     print(
-        f"built {totals['bundles']}/{len(sources)} bundles · {built_pages} pages this run"
+        f"built {built_bundles}/{len(sources)} bundles · {built_pages} pages this run"
         f"{carried_note} · corpus now {totals['pages']} pages, "
         f"{totals['bytes'] / 1024 / 1024:.1f} MB in {elapsed}s"
     )

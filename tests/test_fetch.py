@@ -146,8 +146,14 @@ class FrontmatterTest(unittest.TestCase):
     def test_normalise_date_always_returns_utc(self):
         self.assertEqual(normalise_date("2026-01-02T03:04:05+02:00"), "2026-01-02T01:04:05Z")
         self.assertEqual(normalise_date("2026-01-02T03:04:05Z"), "2026-01-02T03:04:05Z")
-        # A garbled date must not become a plausible-looking one.
-        self.assertRegex(normalise_date("not a date"), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        # A garbled date must not become a plausible-looking one. It returns empty
+        # and the caller falls back to the source's real snapshot date: a build-time
+        # date here would make a stale corpus look fresh, which is the single thing
+        # `sources` exists to prevent.
+        self.assertEqual(normalise_date("not a date"), "")
+        self.assertEqual(normalise_date(""), "")
+        # The `Z` suffix is handled explicitly rather than relying on 3.11+ parsing.
+        self.assertEqual(normalise_date("2026-01-02T03:04:05z"), "2026-01-02T03:04:05Z")
 
 
 class MarkdownTest(unittest.TestCase):
@@ -335,7 +341,10 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("**/vendor/**", source.exclude)
 
     def test_the_shipped_sources_file_loads(self):
-        sources, global_exclude = load_sources(Path(fetch.__file__).with_name("sources.yaml"))
+        sources, global_exclude, defaults = load_sources(
+            Path(fetch.__file__).with_name("sources.yaml")
+        )
+        self.assertIsInstance(defaults, dict)
         self.assertGreaterEqual(len(sources), 14)
         self.assertTrue(global_exclude)
         names = {s.name for s in sources}
@@ -380,9 +389,27 @@ class BuildPagesTest(unittest.TestCase):
     def test_oversized_files_are_skipped_and_counted(self):
         checkout = self.make_checkout({"big.md": "# B\n\n" + "x" * 5000, "small.md": "# S\n\nok body text\n"})
         source = make_source(convert="none", max_file_bytes=1000)
-        pages, skipped, _ = build_pages(source, checkout, lambda _m: None)
+        pages, counts, _ = build_pages(source, checkout, lambda _m: None)
         self.assertEqual([p.rel_path for p in pages], ["small.md"])
-        self.assertGreaterEqual(skipped, 1)
+        self.assertEqual(counts.oversized, 1)
+        self.assertEqual(counts.total, 1)
+
+    def test_every_filter_drop_is_counted_by_reason(self):
+        # The first version counted none of these: files dropped by a glob simply
+        # vanished, so the manifest could not show what the filters removed.
+        checkout = self.make_checkout({
+            "keep.md": "# Keep\n\nbody text long enough\n",
+            "notes/CHANGELOG.md": "# Changelog\n\nbody text long enough\n",
+            "locale/fr/x.md": "# Fr\n\nbody text long enough\n",
+        })
+        source = make_source(
+            include=("**/*.md",), exclude=("**/changelog*",), convert="none", max_file_bytes=10_000
+        )
+        pages, counts, _ = build_pages(source, checkout, lambda _m: None)
+        self.assertEqual([p.rel_path for p in pages], ["keep.md"])
+        self.assertEqual(counts.glob, 1)
+        self.assertEqual(counts.locale, 1)
+        self.assertEqual(counts.total, 2)
 
     def test_collisions_are_counted_not_silently_overwritten(self):
         checkout = self.make_checkout(

@@ -73,18 +73,21 @@ upstream is archived.
 
 ## Sources
 
-| Source | Kind | Note |
-|---|---|---|
-| n8n | git | 1,332 markdown pages, no conversion |
-| grafana, loki | git | `docs/sources`, path-filtered out of a large repository |
-| rocketchat | git | markdown |
-| authentik, zulip | git | MDX: imports and JSX tags removed, prose kept |
-| nextcloud | git (rst) | 529 RST files, converted with pandoc |
-| borg, restic | git (rst) | pandoc |
-| vaultwarden, uptime-kuma | wiki | the `.wiki.git` repository |
-| brevo | llms | `llms-full.txt`, split per section |
-| line | llms | `llms.txt` |
-| erpnext | git | **archived upstream (2021)** — see below |
+Three kinds — `git`, `wiki`, `llms` — and a `convert:` field per source: `auto`
+strips MDX syntax, `rst` runs pandoc, `none` copies markdown verbatim.
+
+| Source | Kind | Convert | Note |
+|---|---|---|---|
+| n8n | git | auto | 1,506 markdown files in the repository, ~1,330 pages after filtering |
+| grafana, loki | git | auto | `docs/sources`, path-filtered out of a large repository |
+| rocketchat | git | auto | markdown |
+| authentik, zulip | git | auto | MDX: imports and JSX tags removed, prose kept |
+| nextcloud | git | rst | 529 RST files |
+| borg, restic | git | rst | |
+| vaultwarden, uptime-kuma | wiki | auto | the `.wiki.git` repository |
+| brevo | llms | — | `llms-full.txt`, split per section |
+| line | llms | — | `llms.txt` |
+| erpnext | git | auto | **archived upstream (2021)** — see below |
 
 RST is the only format that needs an external tool. `pandoc` is a binary, not a
 pip package:
@@ -92,9 +95,13 @@ pip package:
 ```bash
 # Debian/Ubuntu
 apt-get install -y pandoc
-# anywhere, without root: the static release binary
-curl -sL https://github.com/jgm/pandoc/releases/latest/download/pandoc-3.11-linux-amd64.tar.gz \
-  | tar xz -C .tools --strip-components=1
+
+# Without root: the static release binary. `latest/download/` cannot be combined
+# with a versioned filename, so pin the tag — and pandoc is looked up on PATH, so
+# extract it into one rather than into ./.tools.
+PANDOC_VERSION=3.11
+curl -sL "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz" \
+  | tar xz --strip-components=2 -C /usr/local/bin "pandoc-${PANDOC_VERSION}/bin/pandoc"
 ```
 
 Sources that declare `convert: rst` fail loudly without it rather than writing
@@ -111,6 +118,10 @@ The point of owning the pipeline is deciding what *does not* go in the corpus:
 | `max_file_bytes` | skip link farms and generated dumps (default 256 KB) |
 | `max_pages` | a hard cap per bundle when a source is larger than you want |
 | `ref` | pin the version each organization runs, instead of following the default branch |
+
+Every drop is counted **by reason** in the manifest (`by_glob`, `by_locale`,
+`oversized`, `unreadable`, `empty`) — a corpus that cannot say what it excluded
+cannot be tuned.
 
 ## Deployment
 
@@ -138,7 +149,8 @@ refresh on a schedule with the same command.
 
 | Flag | Meaning |
 |---|---|
-| `--check` | resolve every source and report where it points; writes nothing |
+| `--check` | resolve every source and report where it points; writes nothing. A ref that does not exist fails rather than printing `ok` |
+| `--sources FILE` | the config to read (default: `sources.yaml` beside the script) |
 | `--bundle NAME` | build only these sources (repeatable) |
 | `--out DIR` | corpus root to write (default `./out/okf-bundles`) |
 | `--work DIR` | checkout cache, reused across runs (default `./work`) |
@@ -152,17 +164,29 @@ refresh on a schedule with the same command.
 python3 -m unittest discover -s tests -v
 ```
 
-34 tests over the pure parts: glob matching, filters, MDX and GitBook stripping,
-frontmatter rendering, title/type/resource derivation, index generation, the
-staging swap, and config validation. Three of them are regressions for bugs the
-first real build exposed — an exclude that matched a directory but not its
-contents, a bundle that got no root index because all its pages were nested, and a
-declared `path` leaking into the output layout. Each produced a corpus that looked
-fine.
+42 tests. The unit tests cover the pure parts: glob matching, filters, MDX and
+GitBook stripping, frontmatter rendering, title/type/resource derivation, index
+generation, the staging swap, and config validation.
+
+`tests/test_degradation.py` drives `main()` against real local git repositories, so
+it covers what only appears in a whole build: a source that stops matching keeps its
+previous bundle and is marked stale with its original provenance; an empty first
+build fails instead of shipping a stub; changing `repo` rebuilds from the new one
+rather than reusing the cached checkout; and `--check` fails on a ref that does not
+exist.
+
+Most of these are regressions for bugs a passing unit suite did not catch: an
+exclude that matched a directory but not its contents; a bundle with no root index
+because all its pages were nested; a declared `path` leaking into the output layout;
+525 source landing pages overwritten by generated navigation while still being
+counted; and a source matching nothing silently replacing a good bundle with an empty
+stub. Each produced a corpus that looked fine.
 
 ## Requirements
 
-- Python ≥ 3.11 (uses `tomllib`-era typing, f-strings, `dataclasses`)
+- Python ≥ 3.9. Every annotation is lazy (`from __future__ import annotations`) and
+  no builtin generic is subscripted at runtime. Verified on 3.14; the container
+  image uses 3.13.
 - `pyyaml`
 - `git`
 - `pandoc` — only for `convert: rst`
