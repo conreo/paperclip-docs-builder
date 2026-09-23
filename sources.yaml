@@ -1,0 +1,187 @@
+# Sources for the Paperclip documentation corpus.
+#
+# Adding a source is data, not a program. Each entry says where the documentation
+# lives, which parts of it to keep, and — only when the format demands it — which
+# converter to run. Nothing here executes site-specific fixups: the previous
+# pipeline grew a 20 KB `fix_docs.py` that way, and its early stages can no longer
+# be re-run at all.
+#
+# Conventions
+#   kind: git    clone a repository (or a wiki repository)
+#   kind: llms   fetch an llms.txt / llms-full.txt that the project publishes
+#   convert      auto (default) strips MDX syntax from .mdx and leaves .md alone;
+#                rst requires pandoc; none means copy the markdown verbatim.
+#   ref          pin a branch, tag or commit. Unpinned sources follow the default
+#                branch, which means a rebuild is not reproducible. Pin the version
+#                each organization actually runs.
+#   include/exclude   globs matched against the path relative to `path`.
+#   resource_base     the public URL the pages came from, so a citation resolves.
+
+version: 1
+
+# Applied to every source before its own include/exclude.
+global_exclude:
+  - "**/node_modules/**"
+  - "**/.github/**"
+  # A repository's own root README is contributor-facing — build badges, how to
+  # open a pull request — not documentation. Nested READMEs are a different thing
+  # entirely: in n8n and Nextcloud they are the real content page for a directory,
+  # which is why this pattern has no `**/` and matches only the repository root.
+  # `README.*` rather than `README.md` because exclusion tests the *source* path:
+  # Nextcloud's is README.rst, which only becomes README.md in the output.
+  - "README.*"
+  - "**/changelog*"
+  - "**/CHANGELOG*"
+  - "**/release-notes*"
+  - "**/releasenotes*"
+  - "**/contributing*"
+  - "**/CONTRIBUTING*"
+  - "**/LICENSE*"
+  - "**/CODE_OF_CONDUCT*"
+
+defaults:
+  convert: auto
+  tags: []
+  max_file_bytes: 262144     # 256 KB. Larger pages are link farms or generated dumps.
+  drop_locales: true
+
+sources:
+
+  # ---------------------------------------------------------------- markdown in git
+  n8n:
+    title: n8n
+    kind: git
+    repo: https://github.com/n8n-io/n8n-docs
+    path: docs
+    include: ["**/*.md"]
+    resource_base: https://docs.n8n.io/
+    # ref: main            # 1,506 markdown files; verify the branch before pinning
+
+  erpnext:
+    title: ERPNext / Frappe
+    kind: git
+    repo: https://github.com/frappe/frappe_docs
+    path: frappe_docs/www
+    include: ["**/*.md"]
+    exclude: ["**/archive/**"]
+    resource_base: https://docs.frappe.io/
+    # This repository is ARCHIVED upstream — its last commit is from December 2021
+    # and `archived: true` on the GitHub API. Frappe's current documentation is not
+    # on GitHub at all: docs.frappe.io publishes a 1.9 KB `llms.txt` index whose
+    # pages would need scraping. So this bundle is a 2021 snapshot and is declared
+    # as such; the manifest reports its age and the plugin's `sources` tool passes
+    # that on to the agent. Delete this block if a stale snapshot is worse than none.
+    archived: true
+    note: "upstream archived 2021-12; current docs are not published as a repository"
+
+  grafana:
+    title: Grafana
+    kind: git
+    repo: https://github.com/grafana/grafana
+    path: docs/sources
+    include: ["**/*.md", "**/*.mdx"]
+    resource_base: https://grafana.com/docs/grafana/latest/
+
+  loki:
+    title: Grafana Loki
+    kind: git
+    repo: https://github.com/grafana/loki
+    path: docs/sources
+    include: ["**/*.md", "**/*.mdx"]
+    resource_base: https://grafana.com/docs/loki/latest/
+
+  rocketchat:
+    title: Rocket.Chat
+    kind: git
+    repo: https://github.com/RocketChat/docs
+    include: ["**/*.md", "**/*.mdx"]
+    resource_base: https://docs.rocket.chat/
+
+  # ------------------------------------------------------------------- MDX in git
+  # MDX is markdown plus imports and JSX. The converter drops those and keeps the
+  # prose, so these need no per-source work beyond the glob.
+  authentik:
+    title: authentik
+    kind: git
+    repo: https://github.com/goauthentik/authentik
+    path: website/docs
+    include: ["**/*.mdx", "**/*.md"]
+    resource_base: https://docs.goauthentik.io/
+
+  zulip:
+    title: Zulip
+    kind: git
+    repo: https://github.com/zulip/zulip
+    path: docs
+    include: ["**/*.md", "**/*.mdx"]
+    resource_base: https://zulip.readthedocs.io/en/latest/
+
+  # ------------------------------------------------------------------ RST in git
+  # These are the only sources that need pandoc. It is a binary, not a pip package,
+  # which is why the builder ships as its own container rather than inside the
+  # Paperclip image.
+  nextcloud:
+    title: Nextcloud
+    kind: git
+    repo: https://github.com/nextcloud/documentation
+    include: ["**/*.rst"]
+    convert: rst
+    resource_base: https://docs.nextcloud.com/
+    # ref: stable30        # 529 RST files; pin the major version the org runs
+
+  borg:
+    title: BorgBackup
+    kind: git
+    repo: https://github.com/borgbackup/borg
+    path: docs
+    include: ["**/*.rst"]
+    convert: rst
+    resource_base: https://borgbackup.readthedocs.io/en/stable/
+
+  restic:
+    title: restic
+    kind: git
+    repo: https://github.com/restic/restic
+    path: doc
+    include: ["**/*.rst"]
+    convert: rst
+    resource_base: https://restic.readthedocs.io/en/latest/
+
+  # ------------------------------------------------------------------------ wikis
+  # A wiki is a git repository with a `.wiki.git` suffix. Same adapter, different
+  # remote — worth supporting because two of the products here document only there.
+  vaultwarden:
+    title: Vaultwarden
+    kind: wiki
+    repo: https://github.com/dani-garcia/vaultwarden.wiki.git
+    include: ["**/*.md"]
+    # A wiki has no resource_base by default, and the fallback is the clone URL —
+    # so every citation read `…vaultwarden.wiki.git`, a URL nobody can open. A wiki
+    # page is reachable at `<repo>/wiki/<page>`, minus the suffix.
+    resource_base: https://github.com/dani-garcia/vaultwarden/wiki/
+
+  uptime-kuma:
+    title: Uptime Kuma
+    kind: wiki
+    repo: https://github.com/louislam/uptime-kuma.wiki.git
+    include: ["**/*.md"]
+    resource_base: https://github.com/louislam/uptime-kuma/wiki/
+
+  # --------------------------------------------------------- published llms.txt
+  # No repository and no scrape: the project hands over a single file. `split: h2`
+  # turns one large file into one concept per second-level heading.
+  brevo:
+    title: Brevo
+    kind: llms
+    url: https://developers.brevo.com/llms-full.txt
+    fallback_url: https://developers.brevo.com/llms.txt
+    split: h2
+    resource_base: https://developers.brevo.com/
+
+  line:
+    title: LINE
+    kind: llms
+    url: https://developers.line.biz/llms-full.txt
+    fallback_url: https://developers.line.biz/llms.txt
+    split: h2
+    resource_base: https://developers.line.biz/

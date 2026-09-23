@@ -1,0 +1,4 @@
+out/
+work/
+.tools/
+__pycache__/
