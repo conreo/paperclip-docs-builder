@@ -112,13 +112,26 @@ class LocalBuildTest(unittest.TestCase):
         self.assertEqual(run_build(self.cfg, self.work, self.out), 0)
 
         on_disk = sorted(p.relative_to(self.out / "demo").as_posix() for p in (self.out / "demo").rglob("*.md"))
-        self.assertEqual(on_disk, ["guide/index.md", "guide/intro.md", "index.md"])
-        # Every page reported is a page that exists, and the landing pages kept
-        # their own content rather than being replaced by a listing.
-        self.assertEqual(self.manifest()["sources"]["demo"]["pages"], len(on_disk))
-        guide = (self.out / "demo" / "guide" / "index.md").read_text()
-        self.assertIn("real prose", guide)
-        self.assertNotIn("](index.md)", guide)
+        # The source's landing pages are concepts and live at `overview.md`; every
+        # `index.md` is a generated listing, so none of them is a concept document
+        # (§3.1) and none carries frontmatter (§8).
+        self.assertEqual(
+            on_disk,
+            ["guide/index.md", "guide/intro.md", "guide/overview.md", "index.md", "overview.md"],
+        )
+        # Every file reported is a file that exists — counted by the writer, so a
+        # generated listing cannot go missing from the totals. Concepts and listings
+        # are reported apart, and their sum is what is on disk.
+        demo = self.manifest()["sources"]["demo"]
+        self.assertEqual(demo["pages"] + demo["index_files"], len(on_disk))
+        self.assertEqual(demo["files"], len(on_disk))
+        overview = (self.out / "demo" / "guide" / "overview.md").read_text()
+        self.assertIn("real prose", overview)
+        self.assertIn('type: "', overview)  # still a concept, with frontmatter
+        listing = (self.out / "demo" / "guide" / "index.md").read_text()
+        self.assertNotIn("---", listing)  # a listing, with none
+        self.assertIn("overview.md", listing)  # and the moved page is listed
+        self.assertNotIn("](index.md)", listing)
 
     def test_a_source_that_matches_nothing_keeps_its_previous_bundle(self):
         # The drift case: upstream moves its docs, the globs stop matching, and the

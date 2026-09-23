@@ -55,13 +55,13 @@ from pathlib import Path
 
 import yaml
 
-BUILDER_VERSION = "0.2.1"
+BUILDER_VERSION = "0.3.0"
 
 #: The source kinds this builder knows how to acquire. Kept here so the runner can
 #: refuse a request naming a kind it cannot honour, rather than silently fetching
 #: nothing and reporting a smaller corpus.
 SOURCE_KINDS = ("git", "wiki", "llms", "local")
-OKF_VERSION = "0.1"
+OKF_VERSION = "0.2"
 MANIFEST_FILENAME = "manifest.json"
 
 #: The optional vector index. Two files, deliberately boring: one metadata document
@@ -343,8 +343,12 @@ def render_concept(page: Page) -> str:
         f"description: {yaml_string(page.description)}",
         f"resource: {yaml_string(page.resource)}",
         f"tags: {yaml_list(page.tags)}",
+        # `timestamp` rather than OKF v0.2's `generated: {by, at}` for one reason: the
+        # plugin's frontmatter reader is deliberately flat, so a nested mapping would
+        # be invisible to it — and it is this field the corpus's age comes from. §13.1
+        # permits the fallback, so this is consumable; moving it is a paired change on
+        # both sides, tracked rather than half-done.
         f"timestamp: {yaml_string(page.timestamp)}",
-        f"okf_version: {yaml_string(OKF_VERSION)}",
         "---",
         "",
         page.body.rstrip() + "\n",
@@ -502,8 +506,17 @@ def output_path_for(rel_path: str) -> str:
     return re.sub(r"\.(mdx|rst)$", ".md", rel_path)
 
 
-def navigation_body(subdirectories: list[str], pages: list[tuple[str, str]]) -> str:
-    """The `Sections` and `Pages` lists, with no heading of their own."""
+def navigation_body(
+    subdirectories: list[str],
+    pages: list[tuple[str, str, str]],
+) -> str:
+    """
+    The `Sections` and `Pages` lists, with no heading of their own.
+
+    §8: "Entries SHOULD include the description from the linked concept's frontmatter."
+    A listing of bare titles makes an agent open every page to find out which one it
+    wants, which is the cost progressive disclosure exists to avoid.
+    """
     lines: list[str] = []
     if subdirectories:
         lines += ["## Sections", ""]
@@ -511,18 +524,24 @@ def navigation_body(subdirectories: list[str], pages: list[tuple[str, str]]) -> 
         lines.append("")
     if pages:
         lines += ["## Pages", ""]
-        lines += [f"* [{label}]({target})" for label, target in pages]
+        for label, target, description in pages:
+            suffix = f" - {description}" if description else ""
+            lines.append(f"* [{label}]({target}){suffix}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def index_for(directory: str, subdirectories: list[str], pages: list[tuple[str, str]]) -> str:
+def index_for(directory: str, subdirectories: list[str], pages: list[tuple[str, str, str]]) -> str:
     """
-    A navigation page for one directory, for directories the source has no page for.
+    A navigation page for one directory.
 
     The plugin treats `index.md` as navigation: `list_docs` returns it for that
     level. One per directory is what makes browsing progressive instead of a flat
     dump of a thousand pages.
+
+    These files carry no frontmatter in any directory, including the bundle root —
+    §8 permits an `okf_version` key there and nothing else, and a listing is a
+    listing. `manifest.json` already records which spec version the corpus targets.
     """
     label = directory.rstrip("/").rsplit("/", 1)[-1]
     title = label.replace("-", " ").replace("_", " ").title() if label else "Documentation"
@@ -861,79 +880,142 @@ def slugify(text: str) -> str:
 # ------------------------------------------------------------------ orchestration
 
 
-def write_bundle(staging: Path, source: Source, pages: list[Page]) -> int:
+def landing_paths(pages: list[Page]) -> list[Page]:
     """
-    Write one bundle: its concepts, then navigation for every directory.
+    Move every source landing page off `index.md`, before anything is written.
 
-    A source's own landing page (`index.md` for a directory) *is* that directory's
-    navigation. The first version wrote it and then overwrote it with a generated
-    listing — 525 real pages across these sources were destroyed, and each index
-    listed itself as one of its own children. Where the source has a landing page
-    its content is kept, as a normal concept with its frontmatter, and the
-    generated sections are appended underneath it.
+    §3.1 is explicit: reserved filenames "MUST NOT be used for concept documents", and
+    §8 says an index file carries no frontmatter. A source's landing page is a concept
+    — real prose with a title — so keeping it at `index.md` (which is what this did
+    first) makes it both a reserved-filename violation and a frontmatter violation, on
+    every directory that has one.
+
+    Renaming it to `overview.md` up front means it is an ordinary concept: it appears
+    in its parent's listing, it is searchable like anything else, and every `index.md`
+    the build writes is a pure listing.
+    """
+    taken = {
+        page.rel_path
+        for page in pages
+        if page.rel_path != INDEX_FILENAME and not page.rel_path.endswith("/" + INDEX_FILENAME)
+    }
+    moved: list[Page] = []
+    for page in pages:
+        if page.rel_path == INDEX_FILENAME:
+            candidate = "overview.md"
+        elif page.rel_path.endswith("/" + INDEX_FILENAME):
+            candidate = page.rel_path[: -len(INDEX_FILENAME)] + "overview.md"
+        else:
+            moved.append(page)
+            continue
+        # A source that already has an `overview.md` keeps it: the landing page moves
+        # aside rather than replacing a page somebody wrote deliberately.
+        suffix = 1
+        while candidate in taken:
+            suffix += 1
+            candidate = candidate[: -len("overview.md")] + f"overview-{suffix}.md"
+        taken.add(candidate)
+        moved.append(dataclasses.replace(page, rel_path=candidate))
+    return moved
+
+
+def write_bundle(staging: Path, source: Source, pages: list[Page]) -> tuple[int, int, int]:
+    """
+    Write one bundle: its concepts, then a listing for every directory.
+
+    Every `index.md` is generated as a listing here, with no frontmatter. The pages
+    the source itself provides at those paths were moved to `overview.md` first (see
+    `landing_paths`), so no real content is lost and no reserved filename is a concept.
     """
     bundle_dir = staging / source.name
     bundle_dir.mkdir(parents=True, exist_ok=True)
+    pages = landing_paths(pages)
     total = 0
+    written_concepts = 0
+    written_listings = 0
 
-    # 1. The concepts themselves. `index.md` is skipped here because it is that
-    #    directory's navigation page and is written in step 3.
+    # 1. The concepts.
     for page in pages:
-        if page.rel_path == INDEX_FILENAME or page.rel_path.endswith("/" + INDEX_FILENAME):
-            continue
         target = bundle_dir / page.rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         rendered = page.rendered or render_concept(page)
         target.write_text(rendered, encoding="utf-8")
         total += len(rendered.encode("utf-8"))
+        written_concepts += 1
 
     # 2. The navigation tree, built from the pages rather than from whatever
     #    directories happened to be visited.
-    landing: dict[str, Page] = {}
     tree: dict[str, dict[str, set | list]] = {"": {"dirs": set(), "pages": []}}
-
     for page in pages:
         parts = page.rel_path.split("/")
         directory = "/".join(parts[:-1])
-        if parts[-1] == INDEX_FILENAME:
-            landing[directory] = page
-            continue
         for depth in range(len(parts)):
             tree.setdefault("/".join(parts[:depth]), {"dirs": set(), "pages": []})
-        tree[directory]["pages"].append((page.title, parts[-1]))  # type: ignore[union-attr]
+        tree[directory]["pages"].append((page.title, parts[-1], page.description))  # type: ignore[union-attr]
         for depth in range(len(parts) - 1):
             tree["/".join(parts[:depth])]["dirs"].add(parts[depth])  # type: ignore[union-attr]
 
-    # A directory that exists only because a landing page lives in it still needs
-    # a node, and still needs to appear in its parent's listing.
-    for directory in landing:
-        parts = directory.split("/") if directory else []
-        for depth in range(len(parts) + 1):
-            tree.setdefault("/".join(parts[:depth]), {"dirs": set(), "pages": []})
-        for depth in range(len(parts)):
-            tree["/".join(parts[:depth])]["dirs"].add(parts[depth])  # type: ignore[union-attr]
-
-    # 3. One navigation page per directory. Where the source has its own landing
-    #    page, that page *is* the navigation, so its content is kept and the
-    #    generated sections are appended underneath it.
+    # 3. One listing per directory.
     for directory, node in tree.items():
         subdirectories = sorted(node["dirs"])  # type: ignore[arg-type]
         children = sorted(node["pages"], key=lambda item: item[1])  # type: ignore[arg-type]
         target = bundle_dir / directory / INDEX_FILENAME if directory else bundle_dir / INDEX_FILENAME
         target.parent.mkdir(parents=True, exist_ok=True)
-
-        existing = landing.get(directory)
-        if existing is None:
-            rendered = index_for(directory, subdirectories, children)
-        else:
-            navigation = navigation_body(subdirectories, children)
-            body = existing.body.rstrip()
-            rendered = render_concept(
-                dataclasses.replace(existing, body=f"{body}\n\n{navigation}\n" if navigation else body)
-            )
+        rendered = index_for(directory, subdirectories, children)
         target.write_text(rendered, encoding="utf-8")
         total += len(rendered.encode("utf-8"))
-    return total
+        written_listings += 1
+    # What was written, not what was intended. The original counted the pages it had
+    # collected and then overwrote some of them with generated listings, so the totals
+    # described a corpus that never existed. Returning the counts from the writer makes
+    # the manifest a report rather than a prediction.
+    #
+    # Concepts and listings are returned separately: `pages` keeps meaning *documents*,
+    # which is what an operator reads it as, and their sum is the file count on disk.
+    return total, written_concepts, written_listings
+
+
+def lint_tree(root: Path, log, strict: bool = False) -> dict:
+    """
+    Check the tree we just wrote, and return a summary for the manifest.
+
+    Strict mode is opt-in on purpose. The repository's own output does not yet pass —
+    `okf_version` placement and the legacy `timestamp` are being migrated — and a
+    builder that refuses to produce a corpus until it is perfect would leave an
+    operator with no corpus at all. The default is to say so loudly and keep building,
+    which is the same trade the rest of this pipeline makes for degradation.
+    """
+    # Imported here rather than at module scope so a missing lint module can never stop
+    # a build that would otherwise succeed.
+    import lint as okf_lint
+
+    report = okf_lint.lint_corpus(root)
+    summary = {
+        "errors": len(report.errors),
+        "warnings": len(report.warnings),
+        "infos": len(report.infos),
+        "bundles": report.bundles,
+        "concepts": report.concepts,
+        "indexes": report.indexes,
+        "by_code": {},
+    }
+    for finding in report.findings:
+        summary["by_code"][finding.code] = summary["by_code"].get(finding.code, 0) + 1
+    summary["by_code"] = dict(sorted(summary["by_code"].items(), key=lambda kv: -kv[1]))
+
+    if summary["errors"]:
+        log(
+            f"  lint  {summary['errors']} conformance error(s), "
+            f"{summary['warnings']} warning(s) — run lint.py for the file list"
+        )
+    else:
+        log(f"  lint  conformant: {summary['concepts']} concept(s), {summary['warnings']} warning(s)")
+    if strict and summary["errors"]:
+        raise RuntimeError(
+            f"lint: {summary['errors']} conformance error(s) in the built corpus; "
+            f"run `python3 lint.py {root}` for details"
+        )
+    return summary
 
 
 def concept_text(page: Page) -> str:
@@ -1204,6 +1286,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle", action="append", default=[], help="only these sources")
     parser.add_argument("--limit-pages", type=int, default=0)
     parser.add_argument("--check", action="store_true", help="resolve sources, write nothing")
+    parser.add_argument(
+        "--lint-strict",
+        action="store_true",
+        help="fail the build when the linted output has conformance errors (see lint.py)",
+    )
     parser.add_argument("--no-previous", action="store_true")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument(
@@ -1324,8 +1411,22 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     stale_upstreams.append(result.name)
             if result.ok:
-                write_bundle(staging, source, result.pages_data)
+                written_bytes, written_concepts, written_listings = write_bundle(
+                    staging, source, result.pages_data
+                )
+                result.pages = written_concepts
+                result.bytes = written_bytes
+                # The entry above was built before the write, from the collected count.
+                # These are the numbers the writer actually produced, and they replace
+                # it: a manifest that reports an intention instead of a result is how
+                # it came to claim 525 pages that did not exist.
+                entry["pages"] = written_concepts
+                entry["index_files"] = written_listings
+                entry["files"] = written_concepts + written_listings
+                entry["bytes"] = written_bytes
                 totals["bundles"] += 1
+                totals["index_files"] = totals.get("index_files", 0) + written_listings
+                totals["files"] = totals.get("files", 0) + written_concepts + written_listings
                 built_bundles += 1
                 built_pages += result.pages
                 totals["pages"] += result.pages
@@ -1432,6 +1533,12 @@ def main(argv: list[str] | None = None) -> int:
                     embeddings_note = {"error": str(error)}
                     log(f"  note  no vector index: {error}")
 
+        # Lint what we just wrote, before the swap publishes it. Conformance is a
+        # property of the files, so this costs nothing but IO — no model, no network —
+        # and the result travels with the manifest so an operator (or an agent reading
+        # `sources`) can see the conformance of the corpus they are being served.
+        lint_summary = lint_tree(staging, log, strict=args.lint_strict)
+
         manifest = {
             "okf_version": OKF_VERSION,
             "builder": "paperclip-docs-builder",
@@ -1445,6 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
                 "carried_over": sorted(carried),
             },
             "embeddings": embeddings_note,
+            "lint": lint_summary,
             "filters": {
                 "global_exclude": global_exclude,
                 # The configured defaults, not literals. Hardcoding these made the

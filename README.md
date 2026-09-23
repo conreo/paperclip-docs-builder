@@ -167,6 +167,42 @@ Its snapshot date is the folder's own newest mtime, not the build time: build ti
 would report a local bundle as fresh on every run, which is the one thing the age is
 supposed to tell an agent.
 
+## Conformance: `lint.py`
+
+The corpus targets **OKF v0.2**, the specification published in
+[`GoogleCloudPlatform/knowledge-catalog/okf`](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf).
+Conformance is a property of files, so checking it needs no model and costs no tokens:
+
+```bash
+python3 lint.py out/okf-bundles            # human-readable
+python3 lint.py out/okf-bundles --json     # machine-readable
+python3 lint.py out/okf-bundles --strict   # a warning fails too
+```
+
+Every rule quotes the section of the spec it comes from. Errors are spec violations —
+a concept with no `type` (§4.1), frontmatter in an `index.md` (§8), `okf_version`
+outside the bundle root (§12), an `index.md` used as a concept document (§3.1), a
+`sources` entry with no `resource` (§5.1), `generated` with no `by` (§5.2), a timestamp
+with no explicit offset (§5). Warnings are the quality rules the spec states as SHOULD
+plus hygiene it does not cover at all: markup indexed as prose, undecoded entities,
+binaries read as text, stubs, listings with no descriptions.
+
+**Every build lints itself.** The result goes into `manifest.json` under `lint`, and
+`--lint-strict` fails the build on errors. Strict is opt-in because a builder that
+refuses to produce a corpus until it is perfect leaves an operator with no corpus; the
+default says so loudly and keeps building.
+
+The linter is also how the four divergences found here were found — 5,366 of them, all
+now zero:
+
+| Was | Now |
+|---|---|
+| 4,316 × `okf_version` on every concept | declared once, or not at all |
+| 3,795 × legacy `timestamp` | accepted (§13.1), migration pending |
+| 525 × `index.md` carrying concept frontmatter | landing pages moved to `overview.md` |
+| 525 × reserved filename used as a concept (§3.1) | every `index.md` is a generated listing |
+| 753 × listings with no descriptions | entries carry the child's `description` |
+
 ## The optional vector index
 
 Keyword search is the baseline and needs nothing. If you want semantic retrieval as

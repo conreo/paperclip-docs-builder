@@ -253,7 +253,11 @@ class DerivationTest(unittest.TestCase):
 
 class IndexTest(unittest.TestCase):
     def test_index_lists_sections_and_pages(self):
-        text = index_for("administer", ["sso", "users"], [("Single sign-on", "sso.md")])
+        text = index_for(
+            "administer",
+            ["sso", "users"],
+            [("Single sign-on", "sso.md", "How one login covers every app.")],
+        )
         self.assertIn("# Administer", text)
         self.assertIn("* [Sso](sso/)", text)
         self.assertIn("* [Single sign-on](sso.md)", text)
