@@ -130,9 +130,13 @@ process. It writes a small JSON *request* instead — which sources, at which
 versions — into a folder the operator declared, and this runner is the other half:
 
 ```bash
-./runner.py --requests /paperclip/offline-docs/requests --out /paperclip/offline-docs/okf-bundles --once
-./runner.py --requests /paperclip/offline-docs/requests --out /paperclip/offline-docs/okf-bundles --watch 60
+./runner.py --out /paperclip/offline-docs/okf-bundles --once      # cron or a systemd timer
+./runner.py --out /paperclip/offline-docs/okf-bundles --watch 60  # or poll
 ```
+
+`--requests` is derived from `--out` (as `<out>.requests`) because that is where the plugin writes
+it. Both halves derive the same directory, so neither has to be told a path — and nothing about the
+deployment ends up in a settings page.
 
 `--once` is for cron or a systemd timer; `--watch` polls. After each request it
 writes `response.json` beside it, which the plugin reads, so the operator sees the

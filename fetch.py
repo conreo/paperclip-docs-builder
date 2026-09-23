@@ -55,7 +55,7 @@ from pathlib import Path
 
 import yaml
 
-BUILDER_VERSION = "0.2.0"
+BUILDER_VERSION = "0.2.1"
 
 #: The source kinds this builder knows how to acquire. Kept here so the runner can
 #: refuse a request naming a kind it cannot honour, rather than silently fetching

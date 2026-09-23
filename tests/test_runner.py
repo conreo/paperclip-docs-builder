@@ -84,6 +84,22 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse((self.requests / runner.REQUEST_FILENAME).exists())
         self.assertTrue((self.requests / (runner.REQUEST_FILENAME + runner.DONE_SUFFIX)).exists())
 
+    def test_the_request_folder_is_derived_from_the_corpus(self):
+        # Both halves derive it, so neither has to be told a path. The plugin asked
+        # the operator to choose a directory in its first version, which showed it as
+        # "needs attention" until they did.
+        self.assertEqual(
+            runner.requests_dir_for(Path("/srv/docs/okf-bundles")),
+            Path("/srv/docs/okf-bundles.requests"),
+        )
+
+    def test_an_absent_request_folder_is_not_an_error(self):
+        # Nobody has asked for a rebuild yet, which is the normal state of a corpus
+        # that is already up to date.
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = runner.main(["--out", str(self.tmp / "never-built"), "--quiet"])
+        self.assertEqual(code, 0)
+
     def test_no_request_is_not_an_error(self):
         # Cron's exit code should mean "something needs attention", not "nothing to do".
         self.assertEqual(self.run_once(), 0)

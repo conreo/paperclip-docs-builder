@@ -58,6 +58,18 @@ import yaml  # noqa: E402
 
 REQUEST_FILENAME = "request.json"
 RESPONSE_FILENAME = "response.json"
+
+
+def requests_dir_for(corpus_root: Path) -> Path:
+    """
+    Where the plugin writes its requests, derived from the corpus root.
+
+    Both halves derive this the same way so that neither has to be *told* a path.
+    The plugin's first version asked the operator to choose a directory for it,
+    which is a deployment detail leaking into a settings page; a sibling of the
+    corpus is implied by where the corpus already is.
+    """
+    return corpus_root.with_name(corpus_root.name + ".requests")
 #: The schema this runner understands. A newer plugin must not be silently ignored.
 SUPPORTED_SCHEMA = 1
 #: Requests are renamed rather than deleted: an operator chasing a failure needs
@@ -268,18 +280,30 @@ def write_response(requests: Path, outcome: Outcome) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Honour paperclip-docs refresh requests.")
-    parser.add_argument("--requests", required=True, help="the folder the plugin writes requests into")
-    parser.add_argument("--out", default="./out/okf-bundles", help="fallback corpus root")
+    parser.add_argument("--out", default="./out/okf-bundles", help="the corpus root")
+    parser.add_argument(
+        "--requests",
+        default="",
+        help="override the request folder; by default it is derived from --out "
+        "(<out>.requests), which is where the plugin writes",
+    )
     parser.add_argument("--once", action="store_true", default=True, help="handle one request and exit")
     parser.add_argument("--watch", type=int, metavar="SECONDS", help="poll instead of exiting")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
-    requests = Path(args.requests).expanduser()
-    if not requests.is_dir():
-        print(f"the request folder does not exist: {requests}", file=sys.stderr)
-        return 2
     corpus_root = Path(args.out).expanduser()
+    # Derived unless overridden, so a deployment that points the plugin at a corpus
+    # has already told the runner everything it needs.
+    requests = (
+        Path(args.requests).expanduser() if args.requests else requests_dir_for(corpus_root)
+    )
+    # An absent request folder is not an error: it means no one has asked for a
+    # rebuild yet, which is the normal state of a corpus that is up to date.
+    if not requests.is_dir():
+        if not args.quiet:
+            print(f"no request folder yet: {requests}")
+        return 0
 
     def log(message: str) -> None:
         if not args.quiet:
