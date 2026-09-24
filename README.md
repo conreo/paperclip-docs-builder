@@ -244,8 +244,20 @@ The corpus is swapped into place rather than written over: the new tree is built
 beside the live one and renamed, so an agent mid-read never sees a half-written
 corpus. One `okf-bundles.previous` is kept.
 
-Then point the plugin's `corpusRoot` at `/paperclip/offline-docs/okf-bundles`, and
-refresh on a schedule with the same command.
+Then point the plugin's `corpusRoot` at `/paperclip/offline-docs/okf-bundles`.
+
+### The plugin cannot run any of this
+
+That one-shot command is fine for a first corpus, but the plugin cannot invoke it: its
+worker has no way to spawn a process. It writes a *request* instead, and something on
+the host has to honour it — `runner.py`, which polls `<corpus>.requests/` every 30 s and
+writes `response.json` back.
+
+That runner, the optional embedding server, and the tailnet route the plugin's outbound
+guard requires are all in **[`deploy/`](deploy/README.md)**. Read it before operating
+this: it has the measured timings, the path-namespace difference between a containerised
+plugin and a host runner, the flags that fail in confusing ways, and a troubleshooting
+table.
 
 ## Options
 
