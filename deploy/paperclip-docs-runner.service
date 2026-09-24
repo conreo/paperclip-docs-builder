@@ -1,0 +1,19 @@
+[Unit]
+Description=Honour paperclip-docs corpus and index requests
+Documentation=https://github.com/conreo/paperclip-docs-builder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The corpus usually lives inside a Docker volume, and /var/lib/docker/volumes is
+# root-only, so the runner has to be root to read and swap the corpus tree.
+ExecStart=/usr/bin/python3 /opt/paperclip-docs-builder/runner.py --out /var/lib/docker/volumes/docker_paperclip-data/_data/offline-docs/okf-bundles --watch 30
+# Rebuilding 13,000 documents should never be the reason a control plane feels slow.
+Nice=10
+Restart=always
+RestartSec=15
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Expose a LAN embedding server on the tailnet for the Docs plugin
+Documentation=https://github.com/conreo/paperclip-docs-builder/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Paperclip's plugin worker calls through ctx.http.fetch, which refuses private IPv4
+# (10/8, 172.16/12, 192.168/16, 127/8, link-local) and allows the tailnet range
+# 100.64/10. So an embedder on the LAN is unreachable from the worker while a tailnet
+# address is not. This forwards a tailnet address to the LAN one, so the plugin can
+# call the GPU embedder without the embedder itself having to join the tailnet.
+#
+# Set the addresses to your own: TAILNET_IP is this host's tailnet address, EMBEDDER
+# is the LAN address and port of the server started by docs-embed.container.
+ExecStart=/usr/bin/socat TCP-LISTEN:8082,bind=100.89.228.101,fork,reuseaddr TCP:192.168.1.225:8081
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

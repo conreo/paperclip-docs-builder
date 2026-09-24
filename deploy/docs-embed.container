@@ -1,0 +1,37 @@
+#!/bin/sh
+# The embedding server: llama.cpp with --embeddings.
+#
+# Two flags are not optional and both fail in ways that look like something else:
+#
+#   --embeddings        without it /v1/embeddings answers 501 "does not support
+#                       embeddings. Start it with `--embeddings`" — which is at
+#                       least honest, unlike the next one.
+#   -b/-ub 4096         the physical batch must exceed the longest document. The
+#                       default is 512 tokens, and a 2,000-character page is ~600,
+#                       so the server answers 500 "input (665 tokens) is too large
+#                       to process. increase the physical batch size".
+#
+# --pooling cls matches how bge-m3 was trained. Two servers with different pooling
+# produce vectors that are subtly incomparable, which shows up as retrieval that is
+# merely mediocre rather than broken.
+set -e
+MODELS=${MODELS:-/home/rimko/models}
+IMAGE=${IMAGE:-llama-sm61:local}       # this deployment's Pascal-compatible build
+MODEL=${MODEL:-bge-m3-Q8_0.gguf}
+PORT=${PORT:-8081}
+BIND=${BIND:-0.0.0.0}
+
+docker rm -f docs-embed >/dev/null 2>&1 || true
+docker run -d --name docs-embed --restart unless-stopped \
+  --gpus all \
+  -v "$MODELS":/models \
+  -p "$BIND:$PORT:8080" \
+  "$IMAGE" \
+  -m "/models/$MODEL" --host 0.0.0.0 --port 8080 \
+  --embeddings -ngl 99 -c 4096 -b 4096 -ub 4096 --parallel 1 --pooling cls
+
+sleep 20
+docker logs docs-embed 2>&1 | grep -E "model loaded|listening|error" | tail -3
+printf 'verify: '
+curl -sS -m 20 -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/v1/embeddings" \
+  -H 'Content-Type: application/json' -d "{\"model\":\"bge-m3\",\"input\":[\"single sign-on\"]}"
