@@ -1266,6 +1266,173 @@ def index_corpus(
     return len(pages), dim
 
 
+def drop_index_rows(root: Path, bundles: list[str], log) -> int:
+    """
+    Rewrite the index without the rows belonging to `bundles`.
+
+    Rows are dropped, never re-embedded: every surviving vector is byte-identical, so
+    removing one bundle cannot change what semantic search does for the pages that
+    stay. `complete` is deliberately left alone — dropping rows cannot make a partial
+    index whole, and it cannot make a whole one partial.
+    """
+    meta_path = root / EMBEDDINGS_JSON
+    binary_path = root / EMBEDDINGS_BIN
+    if not meta_path.is_file() or not binary_path.is_file():
+        return 0
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return 0
+    ids = meta.get("concept_ids")
+    dim = meta.get("dim")
+    count = meta.get("count")
+    if not isinstance(ids, list) or not isinstance(dim, int) or not isinstance(count, int):
+        return 0
+
+    raw = binary_path.read_bytes()
+    row_bytes = dim * 4
+    if len(raw) != count * row_bytes or len(ids) != count:
+        raise RuntimeError("the index is inconsistent with its metadata; refusing to prune it")
+
+    prefixes = tuple(f"{bundle}/" for bundle in bundles)
+    keep = [index for index, concept_id in enumerate(ids) if not concept_id.startswith(prefixes)]
+    dropped = count - len(keep)
+    if dropped == 0:
+        return 0
+
+    # Sliced as bytes rather than unpacked into floats: a 13,000-row matrix is 53 MB,
+    # and turning that into Python floats to copy most of it back would cost hundreds
+    # of megabytes to accomplish a byte copy.
+    kept = b"".join(raw[index * row_bytes : (index + 1) * row_bytes] for index in keep)
+    meta["concept_ids"] = [ids[index] for index in keep]
+    meta["count"] = len(keep)
+    meta["bundles"] = sorted({concept_id.split("/", 1)[0] for concept_id in meta["concept_ids"]})
+    meta["built_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    binary_tmp = root / (EMBEDDINGS_BIN + ".tmp")
+    json_tmp = root / (EMBEDDINGS_JSON + ".tmp")
+    binary_tmp.write_bytes(kept)
+    json_tmp.write_text(json.dumps(meta, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(binary_tmp, binary_path)
+    os.replace(json_tmp, meta_path)
+    log(f"  dropped {dropped} vector(s); the index now holds {len(keep)}")
+    return dropped
+
+
+def prune_bundles(root: Path, bundles: list[str], log) -> dict:
+    """
+    Remove bundles from the corpus, and their vectors from the index — fetching nothing.
+
+    Deleting documentation is the one operation that must not re-fetch. The sources
+    may have moved, changed shape, or been removed already, and the point of removing
+    a bundle is that its pages stop being served and its disk stops being spent — not
+    that a pipeline runs again. So the pages go, the matrix loses exactly the rows
+    whose concept ids belonged to them, and the manifest stops claiming them.
+
+    Idempotent on purpose: a bundle that is already gone is reported and not an error,
+    because a request that is retried after succeeding must not look like a failure.
+    """
+    if not root.is_dir():
+        raise RuntimeError(f"no corpus at {root}")
+
+    requested: list[str] = []
+    for raw in bundles:
+        name = str(raw).strip()
+        # A trailing slash is how a folder is written and harmless; any *other*
+        # separator means the caller passed a path, which this never accepts — a
+        # leading slash that simply got stripped turned `/etc` into a silent no-op.
+        if name.endswith("/"):
+            name = name.rstrip("/")
+        if not name or "/" in name or "\\" in name or name in (".", "..") or name.startswith("~"):
+            raise RuntimeError(f"{raw!r} is not a bundle name")
+        if name not in requested:
+            requested.append(name)
+
+    existing = {
+        path.name for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")
+    }
+    removing = [name for name in requested if name in existing]
+    missing = [name for name in requested if name not in existing]
+
+    removed: list[dict] = []
+    for name in removing:
+        target = root / name
+        pages = sum(1 for _ in target.rglob("*.md"))
+        sizes = [path.stat().st_size for path in target.rglob("*") if path.is_file()]
+        freed = sum(sizes)
+        shutil.rmtree(target)
+        removed.append({"bundle": name, "pages": pages, "bytes": freed})
+        log(f"  removed {name}: {pages} page(s), {freed / 1e6:.1f} MB")
+
+    dropped_by_bundle: dict[str, int] = {}
+    if removed:
+        # Counted before the rewrite, so the summary can say what each bundle cost in
+        # vectors rather than only what the corpus as a whole lost.
+        meta_path = root / EMBEDDINGS_JSON
+        if meta_path.is_file():
+            try:
+                before_ids = json.loads(meta_path.read_text(encoding="utf-8")).get("concept_ids") or []
+            except json.JSONDecodeError:
+                before_ids = []
+            for name in removing:
+                prefix = f"{name}/"
+                dropped_by_bundle[name] = sum(1 for cid in before_ids if cid.startswith(prefix))
+        drop_index_rows(root, removing, log)
+
+    for entry in removed:
+        entry["vectors"] = dropped_by_bundle.get(entry["bundle"], 0)
+
+    for name in missing:
+        log(f"  already absent: {name}")
+
+    if removed:
+        forget_in_manifest(root, removed, log)
+
+    return {"removed": removed, "missing": missing}
+
+
+def forget_in_manifest(root: Path, removed: list[dict], log) -> None:
+    """
+    Stop the manifest claiming bundles that are no longer there.
+
+    Recorded as history rather than simply deleted: an operator looking at a corpus
+    whose `sources` shrank needs to see that something was removed and when, or the
+    pages simply vanish and the manifest quietly disagrees with the tree.
+    """
+    path = root / MANIFEST_FILENAME
+    if not path.is_file():
+        return
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(manifest, dict):
+        return
+
+    sources = manifest.get("sources")
+    if isinstance(sources, dict):
+        for entry in removed:
+            sources.pop(entry["bundle"], None)
+    totals = manifest.get("totals")
+    if isinstance(totals, dict):
+        totals["pages"] = max(0, int(totals.get("pages") or 0) - sum(e["pages"] for e in removed))
+        totals["bundles"] = max(0, int(totals.get("bundles") or 0) - len(removed))
+
+    history = manifest.get("pruned")
+    if not isinstance(history, list):
+        history = []
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for entry in removed:
+        history.append({**entry, "at": stamp})
+    manifest["pruned"] = history
+
+    tmp = root / (MANIFEST_FILENAME + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    log(f"  manifest updated: {len(removed)} bundle(s) forgotten")
+
+
 def local_root(source: Source, local_root_dir: Path) -> Path:
     """Where a `kind: local` folder is, whether it was declared absolute or not."""
     folder = Path(source.folder).expanduser()
@@ -1455,11 +1622,42 @@ def main(argv: list[str] | None = None) -> int:
         help="embed the corpus already at --out, without fetching or rebuilding it",
     )
     parser.add_argument(
+        "--prune",
+        action="append",
+        default=[],
+        metavar="BUNDLE",
+        help="remove a bundle from the corpus at --out and drop its vectors; repeatable, fetches nothing",
+    )
+    parser.add_argument(
         "--local-root",
         default=".",
         help="where a `kind: local` source's relative folder resolves (default: the working directory)",
     )
     args = parser.parse_args(argv)
+
+    if args.prune:
+        # Like `--index-only`, this mode never reads `--sources`: the whole point of
+        # removing a bundle is that it should stop being served whether or not the
+        # thing that produced it still exists.
+        def prune_log(message: str) -> None:
+            print(message, flush=True)
+
+        try:
+            summary = prune_bundles(Path(args.out).expanduser(), args.prune, prune_log)
+        except RuntimeError as error:
+            print(f"  prune failed: {error}", file=sys.stderr)
+            return 1
+        pages = sum(entry["pages"] for entry in summary["removed"])
+        freed = sum(entry["bytes"] for entry in summary["removed"])
+        vectors = sum(entry["vectors"] for entry in summary["removed"])
+        if summary["removed"]:
+            print(
+                f"pruned: {len(summary['removed'])} bundle(s), {pages} page(s), "
+                f"{freed / 1e6:.1f} MB, {vectors} vector(s)"
+            )
+        else:
+            print(f"nothing to remove (already absent: {', '.join(summary['missing'])})")
+        return 0
 
     if args.index_only:
         # `--sources` is not read at all in this mode: rebuilding an index must not

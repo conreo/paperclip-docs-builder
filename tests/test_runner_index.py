@@ -205,3 +205,91 @@ class RunnerIndexTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunnerPruneTest(unittest.TestCase):
+    """`mode: prune` — a removal the runner has to get right on its own."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), StubEmbeddings)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.endpoint = f"http://127.0.0.1:{cls.server.server_port}/v1/embeddings"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        StubEmbeddings.requests = []
+        self.tmp = Path(TemporaryDirectory().name)
+        self.requests = self.tmp / "requests"
+        self.requests.mkdir(parents=True)
+        self.corpus = self.tmp / "corpus" / "okf-bundles"
+        for bundle in ("handbook", "legacy"):
+            page = self.corpus / bundle / "intro.md"
+            page.parent.mkdir(parents=True, exist_ok=True)
+            page.write_text(f"---\ntitle: \"{bundle}\"\n---\n\nBody of {bundle}.\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            fetch.main([
+                "--index-only", "--out", str(self.corpus),
+                "--embed-endpoint", self.endpoint, "--embed-model", "stub-model",
+            ])
+
+    def write_request(self, body: dict) -> None:
+        (self.requests / runner.REQUEST_FILENAME).write_text(json.dumps(body))
+
+    def prune_request(self, bundles, mode="prune"):
+        self.write_request({
+            "schema": 1,
+            "requestedAt": "2026-09-23T00:00:00Z",
+            "reason": "test",
+            "corpusRoot": str(self.corpus),
+            "mode": mode,
+            "sources": [],
+            "remove": {"bundles": bundles},
+        })
+
+    def run_once(self) -> int:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return runner.main(["--requests", str(self.requests), "--out", str(self.corpus), "--quiet"])
+
+    def response(self) -> dict:
+        return json.loads((self.requests / runner.RESPONSE_FILENAME).read_text())
+
+    def test_a_prune_reports_what_it_removed_and_needs_no_sources(self):
+        self.prune_request(["legacy"])
+        self.assertEqual(self.run_once(), 0)
+
+        response = self.response()
+        self.assertEqual(response["status"], "built")
+        self.assertIn("removed 1 bundle", response["reason"])
+        self.assertEqual(response["removed"][0]["bundle"], "legacy")
+        self.assertEqual(response["removed"][0]["pages"], 1)
+        self.assertEqual(response["removed"][0]["vectors"], 1)
+        self.assertFalse((self.corpus / "legacy").exists())
+        self.assertTrue((self.corpus / "handbook").exists())
+        self.assertTrue((self.requests / (runner.REQUEST_FILENAME + runner.DONE_SUFFIX)).exists())
+
+    def test_a_prune_with_no_bundles_is_refused_by_name(self):
+        self.prune_request([])
+        self.assertEqual(self.run_once(), 1)
+        response = self.response()
+        self.assertEqual(response["status"], "refused")
+        self.assertIn("remove.bundles", response["reason"])
+
+    def test_a_prune_naming_a_path_is_refused(self):
+        # `../handbook` would otherwise be a directory traversal dressed as a bundle.
+        self.prune_request(["../handbook"])
+        self.assertEqual(self.run_once(), 1)
+        self.assertIn("not a bundle name", self.response()["reason"])
+        self.assertTrue((self.corpus / "handbook").exists())
+
+    def test_prune_does_not_skip_a_recent_corpus(self):
+        # A deletion must never be skipped because the corpus looks freshly built.
+        self.prune_request(["legacy"])
+        self.assertEqual(self.run_once(), 0)
+        self.prune_request(["handbook"])
+        self.assertEqual(self.run_once(), 0)
+        self.assertFalse((self.corpus / "handbook").exists())

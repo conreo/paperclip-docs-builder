@@ -74,8 +74,10 @@ def requests_dir_for(corpus_root: Path) -> Path:
 #: The schema this runner understands. A newer plugin must not be silently ignored.
 SUPPORTED_SCHEMA = 1
 #: The halves of the pipeline a request can ask for. `index` deliberately fetches
-#: nothing, so it can run against a corpus whose sources are long gone.
-MODES = ("okf", "index", "both")
+#: nothing, so it can run against a corpus whose sources are long gone — and `prune`
+#: goes further: it removes pages and their vectors, and must not need the thing that
+#: produced them to still exist.
+MODES = ("okf", "index", "both", "prune")
 #: Requests are renamed rather than deleted: an operator chasing a failure needs
 #: the exact document that caused it.
 DONE_SUFFIX = ".done"
@@ -96,6 +98,8 @@ class Outcome:
     #: What the vector index now holds, when the request asked for one. Its own field
     #: rather than part of `reason` because the settings page shows the counts.
     index: dict = dataclasses.field(default_factory=dict)
+    #: What a `prune` removed, one entry per bundle, for the same reason.
+    removed: list = dataclasses.field(default_factory=list)
     error: str = ""
 
     def as_dict(self) -> dict:
@@ -126,6 +130,36 @@ def corpus_built_at(corpus_root: Path) -> str:
         return ""
     value = manifest.get("built_at")
     return value if isinstance(value, str) else ""
+
+
+def is_bundle_name(value: object) -> bool:
+    """
+    Whether this is a bundle's name and not a path.
+
+    Shared by the two places that take a bundle from a request, so the validation
+    cannot be right in one and wrong in the other. A trailing slash is how a folder is
+    written and is accepted; any other separator means the caller passed a path.
+    """
+    name = str(value).strip()
+    if name.endswith("/"):
+        name = name.rstrip("/")
+    return bool(name) and "/" not in name and "\\" not in name and name not in (".", "..") and not name.startswith("~")
+
+
+def bundle_list(request: dict) -> list[str]:
+    """The bundle names a `prune` request asks for, normalized. Empty when absent."""
+    remove = request.get("remove")
+    raw = remove.get("bundles") if isinstance(remove, dict) else None
+    if not isinstance(raw, list):
+        return []
+    names = []
+    for value in raw:
+        name = str(value).strip()
+        if name.endswith("/"):
+            name = name.rstrip("/")
+        if name:
+            names.append(name)
+    return names
 
 
 def request_mode(request: dict) -> str:
@@ -179,6 +213,18 @@ def validate_request(request: dict) -> str:
         # The corpus is already on disk, so no registry is involved — which is the
         # point. Rebuilding an index must not depend on the sources that built the
         # corpus still existing, still resolving, or still being declared.
+        return ""
+
+    if mode == "prune":
+        # Removal needs neither sources nor an endpoint: nothing is fetched and
+        # nothing is embedded. What it removes is checked here, because a name that
+        # escapes the corpus is a mistake in the caller, not a bundle.
+        bundles = bundle_list(request)
+        if not bundles:
+            return "mode 'prune' needs remove.bundles naming what to remove"
+        for position, name in enumerate(bundles):
+            if not is_bundle_name(name):
+                return f"remove.bundles[{position}] {name!r} is not a bundle name"
         return ""
 
     sources = request.get("sources")
@@ -268,6 +314,71 @@ def rebuild_index(root: Path, embed: dict, requested_at: str, log, note: str = "
     )
 
 
+def prune_corpus(root: Path, request: dict, requested_at: str, log, note: str = "") -> Outcome:
+    """
+    `mode: prune` — delete bundles and drop their vectors, fetching nothing.
+
+    Measured before the call rather than parsed out of the builder's stdout: the
+    response has to say what was removed even when the builder's log lines change,
+    and the counts are one stat and one pass over the concept ids.
+    """
+    bundles = bundle_list(request)
+
+    vectors: dict[str, int] = {}
+    meta_path = root / fetch.EMBEDDINGS_JSON
+    if meta_path.is_file():
+        try:
+            ids = json.loads(meta_path.read_text(encoding="utf-8")).get("concept_ids") or []
+        except (OSError, json.JSONDecodeError):
+            ids = []
+        for name in bundles:
+            prefix = f"{name}/"
+            vectors[name] = sum(1 for concept_id in ids if str(concept_id).startswith(prefix))
+
+    pages: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    for name in bundles:
+        target = root / name
+        if target.is_dir():
+            pages[name] = sum(1 for _ in target.rglob("*.md"))
+            sizes[name] = sum(path.stat().st_size for path in target.rglob("*") if path.is_file())
+
+    log(f"  pruning {', '.join(bundles)}")
+    code = fetch.main(["--prune", *bundles, "--out", str(root)])
+    if code != 0:
+        return Outcome(
+            status="failed",
+            reason="the corpus could not be pruned",
+            requested_at=requested_at,
+            finished_at=now_iso(),
+            corpus_root=str(root),
+            error=f"the builder exited {code}",
+        )
+
+    removed = [
+        {
+            "bundle": name,
+            "pages": pages.get(name, 0),
+            "bytes": sizes.get(name, 0),
+            "vectors": vectors.get(name, 0),
+        }
+        for name in bundles
+    ]
+    total_pages = sum(entry["pages"] for entry in removed)
+    total_vectors = sum(entry["vectors"] for entry in removed)
+    return Outcome(
+        status="built",
+        reason=(
+            f"removed {len(removed)} bundle(s): {total_pages} page(s), {total_vectors} vector(s)"
+            + (f" — {note}" if note else "")
+        ),
+        requested_at=requested_at,
+        finished_at=now_iso(),
+        corpus_root=str(root),
+        removed=removed,
+    )
+
+
 def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
     """
     Do the work for one pending request.
@@ -331,6 +442,14 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
         # No corpus build, so the "already built after this request" skip below does
         # not apply: the corpus being fresh says nothing about whether its index is.
         outcome = rebuild_index(root, embed, requested_at, log, relocated)
+        suffix = DONE_SUFFIX if outcome.status == "built" else FAILED_SUFFIX
+        request_path.rename(request_path.with_name(request_path.name + suffix))
+        return outcome
+
+    if mode == "prune":
+        # For the same reason, and more so: a deletion is never something to skip
+        # because the corpus looks recent.
+        outcome = prune_corpus(root, request, requested_at, log, relocated)
         suffix = DONE_SUFFIX if outcome.status == "built" else FAILED_SUFFIX
         request_path.rename(request_path.with_name(request_path.name + suffix))
         return outcome
