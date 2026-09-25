@@ -63,9 +63,11 @@ class RunnerIndexTest(unittest.TestCase):
     def response(self) -> dict:
         return json.loads((self.requests / runner.RESPONSE_FILENAME).read_text())
 
-    def run_once(self) -> int:
+    def run_once(self, *extra: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()):
-            return runner.main(["--requests", str(self.requests), "--out", str(self.corpus), "--quiet"])
+            return runner.main(
+                ["--requests", str(self.requests), "--out", str(self.corpus), "--quiet", *extra]
+            )
 
     def embed_block(self) -> dict:
         return {"endpoint": self.endpoint, "model": "stub-model"}
@@ -163,27 +165,89 @@ class RunnerIndexTest(unittest.TestCase):
         self.assertIn("everything", response["reason"])
         self.assertIn("index", response["reason"])
 
-    def test_a_path_the_host_cannot_see_falls_back_to_the_runners_own_out(self):
+    def test_a_path_the_host_cannot_see_is_refused_not_guessed_at(self):
+        # This used to fall back to the runner's own --out. With one tenant that was a
+        # convenience; with two it is how a request from one organization deletes
+        # another's pages. The runner no longer guesses.
         self.write_request(
             {
                 "schema": 1,
                 "requestedAt": "2026-09-23T00:00:00Z",
                 "reason": "test",
-                # The container's view of the corpus, which does not exist here.
                 "corpusRoot": "/paperclip/offline-docs/okf-bundles",
                 "mode": "index",
                 "embed": self.embed_block(),
             }
         )
-        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.run_once(), 1)
+
+        response = self.response()
+        self.assertEqual(response["status"], "refused")
+        self.assertIn("not configured to serve", response["reason"])
+        # And nothing was written into the corpus it would have guessed at.
+        self.assertFalse((self.corpus / fetch.EMBEDDINGS_JSON).exists())
+        self.assertFalse((self.corpus / fetch.EMBEDDINGS_BIN).exists())
+
+    def test_a_declared_path_is_served_when_the_operator_maps_it(self):
+        # The container/host namespace difference, solved by declaration rather than by
+        # a fallback: the operator says which path means which.
+        self.write_request(
+            {
+                "schema": 1,
+                "requestedAt": "2026-09-23T00:00:00Z",
+                "reason": "test",
+                "corpusRoot": "/paperclip/offline-docs/okf-bundles",
+                "mode": "index",
+                "embed": self.embed_block(),
+            }
+        )
+        self.assertEqual(
+            self.run_once("--map", f"/paperclip/offline-docs/okf-bundles={self.corpus}"), 0
+        )
 
         response = self.response()
         self.assertEqual(response["status"], "built")
-        # Built where the runner was told the corpus is, and said so rather than
-        # silently pretending the two paths are the same thing.
         self.assertEqual(response["corpus_root"], str(self.corpus))
-        self.assertIn("cannot see", response["reason"])
+        self.assertIn("maps to", response["reason"])
         self.assertTrue((self.corpus / fetch.EMBEDDINGS_JSON).is_file())
+
+    def test_another_corpus_the_runner_was_not_told_about_is_refused(self):
+        # It exists, it is a directory, and it is still not this runner's business.
+        other = self.tmp / "someone-elses"
+        (other / "bundle").mkdir(parents=True)
+        self.write_request(
+            {
+                "schema": 1,
+                "requestedAt": "2026-09-23T00:00:00Z",
+                "reason": "test",
+                "corpusRoot": str(other),
+                "mode": "prune",
+                "sources": [],
+                "remove": {"bundles": ["bundle"]},
+            }
+        )
+        self.assertEqual(self.run_once(), 1)
+        self.assertIn("not configured to serve", self.response()["reason"])
+        self.assertTrue((other / "bundle").is_dir(), "another corpus was deleted")
+
+    def test_a_second_corpus_is_served_when_it_is_listed(self):
+        other = self.tmp / "second"
+        (other / "bundle").mkdir(parents=True)
+        (other / "bundle" / "a.md").write_text("---\ntitle: a\n---\n\nbody\n")
+        self.write_request(
+            {
+                "schema": 1,
+                "requestedAt": "2026-09-23T00:00:00Z",
+                "reason": "test",
+                "corpusRoot": str(other),
+                "mode": "prune",
+                "sources": [],
+                "remove": {"bundles": ["bundle"]},
+            }
+        )
+        self.assertEqual(self.run_once("--corpus", str(other)), 0)
+        self.assertEqual(self.response()["status"], "built")
+        self.assertFalse((other / "bundle").exists())
 
     def test_a_path_the_host_can_see_is_still_honoured(self):
         self.write_request(
@@ -251,9 +315,11 @@ class RunnerPruneTest(unittest.TestCase):
             "remove": {"bundles": bundles},
         })
 
-    def run_once(self) -> int:
+    def run_once(self, *extra: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()):
-            return runner.main(["--requests", str(self.requests), "--out", str(self.corpus), "--quiet"])
+            return runner.main(
+                ["--requests", str(self.requests), "--out", str(self.corpus), "--quiet", *extra]
+            )
 
     def response(self) -> dict:
         return json.loads((self.requests / runner.RESPONSE_FILENAME).read_text())

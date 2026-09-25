@@ -379,14 +379,61 @@ def prune_corpus(root: Path, request: dict, requested_at: str, log, note: str = 
     )
 
 
-def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
+def resolve_corpus(
+    declared: Path,
+    default_root: Path,
+    served_roots: set[Path],
+    root_map: dict[str, str],
+) -> tuple[Path | None, str]:
+    """
+    The corpus a request may act on, or None when it names one this runner refuses.
+
+    The rule is a closed set, not a heuristic: a request can only reach a root the
+    operator listed. `--map` is the one permitted translation, and only for the exact
+    path it was given — so a plugin running in a container can be served by a host
+    runner without any request being able to wander onto another organization's corpus.
+    """
+    def canonical(path: Path) -> Path:
+        try:
+            return path.resolve()
+        except OSError:
+            return Path(os.path.abspath(str(path)))
+
+    allowed = {canonical(entry) for entry in served_roots}
+    allowed.add(canonical(default_root))
+
+    candidates: list[tuple[Path, str]] = [(declared, "")]
+    mapped = root_map.get(str(declared))
+    if mapped:
+        candidates.insert(0, (Path(mapped), f"the request names {declared}, which this host maps to {mapped}"))
+
+    for candidate, note in candidates:
+        if canonical(candidate) in allowed:
+            return candidate, note
+
+    return None, ""
+
+
+def honour_request(
+    requests: Path,
+    corpus_root: Path,
+    log,
+    served_roots: set[Path] | None = None,
+    root_map: dict[str, str] | None = None,
+) -> Outcome:
     """
     Do the work for one pending request.
 
     Returns the outcome; every path out of here is a described state rather than an
     exception, because a cron job that dies silently is worse than one that reports
     a refusal.
+
+    `served_roots` and `root_map` are the isolation boundary — see the comment at the
+    resolution below. They default to "just --out, no translation", which is what a
+    single-tenant deployment is.
     """
+    served_roots = served_roots or set()
+    root_map = root_map or {}
     request_path = requests / REQUEST_FILENAME
     if not request_path.is_file():
         return Outcome(status="idle", reason="no request is waiting")
@@ -412,28 +459,40 @@ def honour_request(requests: Path, corpus_root: Path, log) -> Outcome:
             finished_at=finished,
         )
 
-    # The request names where the corpus belongs; the runner's own --out is the
-    # fallback so a misconfigured plugin cannot scatter corpora around the host.
+    # Which corpus this request is allowed to touch.
     #
-    # It is also the fix for a namespace difference. The plugin writes the path as
-    # *its worker* sees it, and a plugin running in a container sees `/paperclip/…`
-    # where the host has a volume path — so an absolute path the runner cannot
-    # resolve is not a different corpus, it is the same corpus described from
-    # somewhere else. The runner's --out is the operator's own statement of where the
-    # corpus is, so that wins when the declared path is not there.
+    # This used to fall back to the runner's own --out whenever the declared path was
+    # not a directory here, so that a containerised plugin's `/paperclip/…` could be
+    # served by a host runner that only sees `/var/lib/docker/volumes/…`. That fallback
+    # is safe with exactly one tenant and dangerous with two: a request from
+    # organization A naming a path this host cannot see would be applied to
+    # organization B's corpus — `prune` would delete B's pages, and a build would
+    # overwrite the whole tree. The runner has no way to tell "the same corpus,
+    # described elsewhere" from "someone else's corpus".
+    #
+    # So it no longer guesses. It serves the roots it was told to serve (`--out` plus
+    # any `--corpus`), and an explicit `--map DECLARED=ACTUAL` is how an operator says
+    # "this path, from the plugin's namespace, is that path here". Anything else is
+    # refused, for every mode.
     declared_root = Path(str(request["corpusRoot"])).expanduser()
-    relocated = ""
-    if not declared_root.is_absolute():
-        root = corpus_root
-    elif declared_root.is_dir():
-        root = declared_root
-    else:
-        root = corpus_root
-        relocated = (
-            f"the request names {declared_root}, which this host cannot see; "
-            f"used {corpus_root}"
+    root, relocation = resolve_corpus(declared_root, corpus_root, served_roots, root_map)
+    if root is None:
+        request_path.rename(request_path.with_name(request_path.name + FAILED_SUFFIX))
+        return Outcome(
+            status="refused",
+            reason=(
+                f"this runner is not configured to serve {declared_root}. "
+                f"It serves: {', '.join(sorted(str(entry) for entry in served_roots))}"
+                + (
+                    ". A path the plugin sees differently can be declared with --map."
+                    if not root_map
+                    else ""
+                )
+            ),
+            requested_at=requested_at,
+            finished_at=finished,
         )
-        log(f"  note  {relocated}")
+    relocated = relocation
 
     mode = request_mode(request)
     embed = request.get("embed") if isinstance(request.get("embed"), dict) else {}
@@ -536,6 +595,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Honour paperclip-docs refresh requests.")
     parser.add_argument("--out", default="./out/okf-bundles", help="the corpus root")
     parser.add_argument(
+        "--corpus",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="another corpus root this runner may serve; repeatable. A request naming "
+        "anything outside --out plus these is refused, so one runner can serve several "
+        "organizations without any of them reaching another's corpus",
+    )
+    parser.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="DECLARED=ACTUAL",
+        help="translate a corpus path the plugin sees into the path this host sees "
+        "(a container's /paperclip/... is a volume path here); repeatable. Without it, "
+        "a path this host cannot see is refused rather than guessed at",
+    )
+    parser.add_argument(
         "--requests",
         default="",
         help="override the request folder; by default it is derived from --out "
@@ -547,6 +624,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     corpus_root = Path(args.out).expanduser()
+    served_roots = {Path(entry).expanduser() for entry in args.corpus}
+    root_map: dict[str, str] = {}
+    for entry in args.map:
+        if "=" not in entry:
+            print(f"--map needs DECLARED=ACTUAL, got {entry!r}", file=sys.stderr)
+            return 2
+        declared, actual = entry.split("=", 1)
+        root_map[declared.strip()] = actual.strip()
     # Derived unless overridden, so a deployment that points the plugin at a corpus
     # has already told the runner everything it needs.
     requests = (
@@ -564,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
             print(message, flush=True)
 
     def once() -> Outcome:
-        outcome = honour_request(requests, corpus_root, log)
+        outcome = honour_request(requests, corpus_root, log, served_roots, root_map)
         if outcome.status != "idle":
             write_response(requests, outcome)
             log(f"  {outcome.status}: {outcome.reason}")
