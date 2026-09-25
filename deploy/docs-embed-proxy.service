@@ -11,9 +11,11 @@ Wants=network-online.target
 # address is not. This forwards a tailnet address to the LAN one, so the plugin can
 # call the GPU embedder without the embedder itself having to join the tailnet.
 #
-# Set the addresses to your own: TAILNET_IP is this host's tailnet address, EMBEDDER
-# is the LAN address and port of the server started by docs-embed.container.
-ExecStart=/usr/bin/socat TCP-LISTEN:8082,bind=100.89.228.101,fork,reuseaddr TCP:192.168.1.225:8081
+# The upstream is wherever the embedder actually runs, as *this* host reaches it. In
+# the current deployment that is the same VM as the plugin: the GTX 1080 is passed
+# through to it (hostpci0), docs-embed publishes on the LAN address, and this route
+# is what makes it callable from the worker, which refuses private IPv4.
+ExecStart=/usr/bin/socat TCP-LISTEN:8082,bind=100.89.228.101,fork,reuseaddr TCP:192.168.1.222:8081
 Restart=always
 RestartSec=5
 User=root

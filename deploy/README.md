@@ -123,6 +123,24 @@ Why private ranges are refused at all: otherwise a plugin could be pointed at an
 service on the host's own network. The tailnet allowance is what makes a self-hosted
 embedder possible.
 
+## Where this deployment puts things
+
+Written down because the topology has moved once already, and a runbook that describes
+a different machine than the one running is worse than none:
+
+| Piece | Runs on | Address |
+|---|---|---|
+| the plugin + the runner | the Paperclip VM | runner unit watches the corpus volume |
+| `docs-embed` (bge-m3, `--embeddings -ngl 99`) | **the same VM** — the GTX 1080 is passed through to it (`hostpci0`) | publishes on the LAN: `192.168.1.222:8081` |
+| the tailnet route (`socat`) | the same VM | `100.89.228.101:8082` → `192.168.1.222:8081` |
+| `rag.endpoint` | plugin config | **`http://100.89.228.101:8082/v1/embeddings`** |
+
+The GPU and the embeddings live next to the plugin, so the endpoint the plugin is
+allowed to call is the tailnet one, and the socat hop exists only to get a LAN-bound
+publish onto an address the guard accepts. Passing the GPU through to the Paperclip VM
+is what makes that worth doing: at 2,000 characters per concept the same corpus is
+~13 minutes here against ~7 hours on four vCPUs.
+
 ## Ground truth: files and directories
 
 Everything is derived from one path — the corpus root:
