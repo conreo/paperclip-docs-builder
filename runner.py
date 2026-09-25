@@ -482,7 +482,9 @@ def honour_request(
             status="refused",
             reason=(
                 f"this runner is not configured to serve {declared_root}. "
-                f"It serves: {', '.join(sorted(str(entry) for entry in served_roots))}"
+                # `--out` counts as served even though it is not in `--corpus`, and an
+                # operator reading this needs the set that is, not the set they passed.
+                f"It serves: {', '.join(sorted({str(entry) for entry in served_roots} | {str(corpus_root)}))}"
                 + (
                     ". A path the plugin sees differently can be declared with --map."
                     if not root_map

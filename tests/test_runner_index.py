@@ -359,3 +359,29 @@ class RunnerPruneTest(unittest.TestCase):
         self.prune_request(["handbook"])
         self.assertEqual(self.run_once(), 0)
         self.assertFalse((self.corpus / "handbook").exists())
+
+
+class RefusalMessageTest(unittest.TestCase):
+    """The refusal has to name what *is* served, or an operator cannot act on it."""
+
+    def setUp(self):
+        self.tmp = Path(TemporaryDirectory().name)
+        self.requests = self.tmp / "requests"
+        self.requests.mkdir(parents=True)
+        self.corpus = self.tmp / "corpus"
+        self.corpus.mkdir()
+
+    def test_it_lists_out_alongside_any_extra_corpus(self):
+        (self.requests / runner.REQUEST_FILENAME).write_text(json.dumps({
+            "schema": 1,
+            "requestedAt": "2026-09-23T00:00:00Z",
+            "reason": "test",
+            "corpusRoot": "/srv/other-org/okf-bundles",
+            "mode": "prune",
+            "sources": [],
+            "remove": {"bundles": ["x"]},
+        }))
+        with contextlib.redirect_stdout(io.StringIO()):
+            runner.main(["--requests", str(self.requests), "--out", str(self.corpus), "--quiet"])
+        reason = json.loads((self.requests / runner.RESPONSE_FILENAME).read_text())["reason"]
+        self.assertIn(str(self.corpus), reason)
